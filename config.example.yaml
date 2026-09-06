@@ -1,0 +1,36 @@
+project:
+  name: example
+
+listeners:
+  human: 8081
+
+actors:
+  actor_a:
+    firefox_profile: example-ai-a
+    listener: 8082
+
+  actor_b:
+    firefox_profile: example-ai-b
+    listener: 8083
+
+execution:
+  max_concurrent_active_requests: 1
+  requests_per_second: 1
+  burst: 1
+
+budgets:
+  http:
+    max_requests: 250
+    max_mutations: 50
+    max_per_endpoint: 12
+    max_identical_replays: 3
+
+  api:
+    max_cost_usd: 2.00
+    max_model_calls: 100
+    max_input_tokens: 2000000
+    max_output_tokens: 250000
+    warning_thresholds:
+      - 0.50
+      - 0.80
+      - 0.95
