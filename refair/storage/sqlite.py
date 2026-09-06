@@ -155,6 +155,20 @@ class SQLiteRepository:
             raw_response=(bytes(row["raw_response"]) if row["raw_response"] is not None else None),
         )
 
+    def count_observations(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM observations").fetchone()
+        assert row is not None
+        return int(row["count"])
+
+    def list_observations(self) -> tuple[Observation, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM observations ORDER BY observed_at, id"
+            ).fetchall()
+        observations = tuple(self.get_observation(UUID(row["id"])) for row in rows)
+        return tuple(observation for observation in observations if observation is not None)
+
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
         with self._connection() as connection:
             connection.execute(

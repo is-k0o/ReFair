@@ -1,8 +1,6 @@
 project:
+  id: 11111111-1111-4111-8111-111111111111
   name: example
-
-listeners:
-  human: 8081
 
 actors:
   actor_a:
@@ -12,6 +10,11 @@ actors:
   actor_b:
     firefox_profile: example-ai-b
     listener: 8083
+
+bridge:
+  bind_address: 127.0.0.1
+  port: 8765
+  sqlite_path: ./refair.sqlite3
 
 execution:
   max_concurrent_active_requests: 1

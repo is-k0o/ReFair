@@ -1,17 +1,42 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments
 .venv/
 .testdeps/
 venv/
+
+# Python/package build outputs
 dist/
 build/
+
+# Gradle / Java generated files
+.gradle/
+*.class
+out/
+
+# Local databases / runtime state
 *.sqlite
 *.sqlite3
 *.db
-.coverage
-htmlcov/
+
+# Local environment / secrets
 .env
+.env.*
+config.local.yaml
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

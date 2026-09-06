@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -79,8 +79,9 @@ def test_example_configuration_loads_and_keeps_active_limit_at_one() -> None:
     config = load_config("config.example.yaml")
 
     assert config.execution.max_concurrent_active_requests == 1
-    assert config.listeners.human == 8081
     assert {actor.listener for actor in config.actors.values()} == {8082, 8083}
+    assert config.project.id == UUID("11111111-1111-4111-8111-111111111111")
+    assert not hasattr(config, "listeners")
 
 
 def test_configuration_rejects_profile_outside_project_namespace() -> None:
