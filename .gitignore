@@ -42,4 +42,4 @@ config.local.yaml
 Thumbs.db
 
 # Local Burp configuration
-refair-burp-project-settings.json
+refair-burp-project-settings.jsonrefair/refair-project-settings.json
