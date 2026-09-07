@@ -11,7 +11,7 @@ state transitions.
 > LLM proposes. Code constrains. Evidence decides. State remembers. Humans
 > authorize dangerous edge cases.
 
-## V0.1
+## V0.1.5
 
 This repository provides the deterministic foundation plus the first passive
 Burp/Montoya ingestion bridge:
@@ -28,9 +28,11 @@ Burp/Montoya ingestion bridge:
   immutable `Observation` rows;
 - a thin Java 21 Montoya extension that observes completed proxy responses,
   serializes exact request/response bytes with base64, and hands events to a
-  bounded asynchronous transport worker.
+  bounded asynchronous HTTP/1.1 transport worker;
+- a read-only command-line inspector for safe summaries, recent observation
+  metadata, and explicitly bounded raw previews.
 
-V0.1 does **not** generate active traffic, crawl, scan, exploit, automate a
+V0.1.5 does **not** generate active traffic, crawl, scan, exploit, automate a
 browser, call an LLM or Burp AI, use MCP/RAG/vector storage, normalize traffic,
 extract endpoints, provide a UI, or implement multi-agent behavior. It does not
 yet contain a complete scope or authorization policy engine.
@@ -42,7 +44,7 @@ oversized exchanges, full queues, and unload-time drops are logged; there are no
 hidden or infinite retries.
 
 Only completed exchanges are ingested. A request that never receives a response
-is not persisted in V0.1 because raw observations are never created incomplete
+is not persisted in V0.1.5 because raw observations are never created incomplete
 and updated later.
 
 ## Bridge boundary
@@ -52,7 +54,7 @@ Firefox
   -> Burp actor listener
   -> passive Montoya response callback
   -> bounded background transport
-  -> HTTP + JSON on 127.0.0.1:8765
+  -> HTTP/1.1 + JSON on 127.0.0.1:8765
   -> Python collector
   -> immutable Observation
   -> SQLite
@@ -73,6 +75,7 @@ Java-to-Python bridge transport; it is not a Burp proxy listener.
 refair/
   assets/       content-based static asset identity
   bridge/       strict passive collector transport and CLI
+  inspect/      read-only observation inspection CLI
   models/       domain, budget, experiment, and run-state models
   policy/       deterministic budget and active-concurrency controls
   storage/      explicit SQLite schema and repository
@@ -101,7 +104,9 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
-The tests use temporary SQLite databases and perform no network activity.
+The automated tests use temporary SQLite databases and require no Burp instance
+or external network access. The Java HTTP/1.1 regression test uses only a local
+loopback socket.
 
 Build and test the Montoya extension with Java 21:
 
@@ -111,7 +116,34 @@ cd burp-extension
 ```
 
 On macOS/Linux, use `./gradlew clean test jar`. The loadable JAR is written to
-`burp-extension/build/libs/refair-burp-extension-0.1.0.jar`.
+`burp-extension/build/libs/refair-burp-extension-0.1.5.jar`.
+
+## Inspect observations
+
+The inspector reads the SQLite path from the same ReFair configuration as the
+collector and opens it read-only:
+
+```powershell
+refair-inspect --config config.example.yaml summary
+refair-inspect --config config.example.yaml list --limit 20
+refair-inspect --config config.example.yaml show <observation-uuid>
+```
+
+The equivalent module form is `python -m refair.inspect`. `list` omits query
+strings by default and supports `--actor`, `--provenance`, `--method`, `--status`,
+and `--full-url` filters/options. `show` prints metadata and byte counts, never raw
+HTTP by default.
+
+Raw evidence may contain credentials, cookies, session tokens, personal data, or
+other sensitive content. A byte-safe preview must be explicitly requested and is
+hard-capped at 4096 bytes per message:
+
+```powershell
+refair-inspect --config config.example.yaml show <observation-uuid> --raw-preview 500
+```
+
+This is bounded presentation, not redaction; immutable stored evidence is never
+changed.
 
 ## Manual smoke test
 
@@ -132,22 +164,38 @@ cd burp-extension
 Then:
 
 1. In Burp, open **Extensions > Installed > Add**, choose Java, and select
-   `burp-extension/build/libs/refair-burp-extension-0.1.0.jar`.
+   `burp-extension/build/libs/refair-burp-extension-0.1.5.jar`.
 2. Keep the existing human listener on 8081 outside ReFair. Configure actor
    listeners 8082 and 8083, and point Firefox profiles `example-ai-a` and
    `example-ai-b` at their respective listeners.
-3. Make one benign request from each actor profile. Completed responses should
-   create two observations in `refair.sqlite3`.
-4. Inspect attribution and byte counts without modifying evidence:
+3. Use explicit marker paths when repeating the smoke test:
 
    ```powershell
-   python -c "from refair.storage import SQLiteRepository; r=SQLiteRepository('refair.sqlite3'); print([(str(o.id), o.actor_id, o.provenance.value, len(o.raw_request), len(o.raw_response or b'')) for o in r.list_observations()])"
+   # Actor A profile through 8082
+   https://example.com/refair-smoke-actor-a
+
+   # Actor B profile through 8083
+   https://example.com/refair-smoke-actor-b
    ```
 
-5. Compare `raw_request` and `raw_response` BLOBs with the corresponding Burp
-   messages if byte-level verification is needed.
-6. Send traffic through 8081 and rerun the inspection command. The observation
+4. Inspect attribution and counts without modifying evidence:
+
+   ```powershell
+   refair-inspect --config config.example.yaml summary
+   refair-inspect --config config.example.yaml list --limit 20
+   refair-inspect --config config.example.yaml show <observation-uuid>
+   ```
+
+5. Use `show <uuid> --raw-preview 500` only when bounded raw-byte verification is
+   required.
+6. Send traffic through 8081 and rerun `summary`. The observation
    count must not increase.
+
+This Firefox/Burp/collector flow was manually validated on Windows for both
+actors: Firefox A through 8082 was attributed to `actor_a`, and Firefox B through
+8083 was attributed to `actor_b`, both with `BROWSER` provenance and preserved
+Montoya request/response bytes. This live check is manual and is distinct from
+the automated Python and Java suites.
 
 The extension defaults to
 `http://127.0.0.1:8765/v1/observations/passive`. If the configured bridge port is

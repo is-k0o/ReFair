@@ -1,5 +1,5 @@
 """Persistence API."""
 
-from refair.storage.sqlite import SQLiteRepository
+from refair.storage.sqlite import ObservationMetadata, ObservationSummary, SQLiteRepository
 
-__all__ = ["SQLiteRepository"]
+__all__ = ["ObservationMetadata", "ObservationSummary", "SQLiteRepository"]

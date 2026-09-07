@@ -84,7 +84,7 @@ def create_app(
         repository = SQLiteRepository(config.bridge.sqlite_path)
     repository.initialize()
     collector = CollectorService(config, repository)
-    app = FastAPI(title="ReFair passive collector", version="0.1.0")
+    app = FastAPI(title="ReFair passive collector", version="0.1.5")
 
     @app.post("/v1/observations/passive", response_model=BridgeResult)
     async def ingest_passive_exchange(request: Request) -> JSONResponse:

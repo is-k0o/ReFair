@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -87,20 +88,47 @@ CREATE INDEX IF NOT EXISTS asset_urls_url_idx ON asset_urls(url);
 """
 
 
+@dataclass(frozen=True)
+class ObservationSummary:
+    total: int
+    by_actor: dict[str, int]
+    by_provenance: dict[str, int]
+
+
+@dataclass(frozen=True)
+class ObservationMetadata:
+    id: UUID
+    project_id: UUID
+    observed_at: datetime
+    provenance: ObservationProvenance
+    actor_id: str | None
+    method: str
+    url: str
+    response_status: int | None
+    request_size: int
+    response_size: int
+
+
 class SQLiteRepository:
     """Repository for immutable evidence, hypotheses, and content-addressed assets."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = read_only
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        if self.read_only:
+            database = f"{self.path.resolve().as_uri()}?mode=ro"
+            connection = sqlite3.connect(database, uri=True)
+        else:
+            connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
-            connection.commit()
+            if not self.read_only:
+                connection.commit()
         except BaseException:
             connection.rollback()
             raise
@@ -108,10 +136,12 @@ class SQLiteRepository:
             connection.close()
 
     def initialize(self) -> None:
+        self._require_writable()
         with self._connection() as connection:
             connection.executescript(SCHEMA)
 
     def add_observation(self, observation: Observation) -> Observation:
+        self._require_writable()
         with self._connection() as connection:
             connection.execute(
                 """
@@ -142,6 +172,88 @@ class SQLiteRepository:
             ).fetchone()
         if row is None:
             return None
+        return self._observation_from_row(row)
+
+    def observation_summary(self) -> ObservationSummary:
+        with self._connection() as connection:
+            total_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM observations"
+            ).fetchone()
+            actor_rows = connection.execute(
+                """
+                SELECT COALESCE(actor_id, 'UNKNOWN') AS category, COUNT(*) AS count
+                FROM observations
+                GROUP BY actor_id
+                ORDER BY category
+                """
+            ).fetchall()
+            provenance_rows = connection.execute(
+                """
+                SELECT provenance AS category, COUNT(*) AS count
+                FROM observations
+                GROUP BY provenance
+                ORDER BY category
+                """
+            ).fetchall()
+        assert total_row is not None
+        return ObservationSummary(
+            total=int(total_row["count"]),
+            by_actor={row["category"]: int(row["count"]) for row in actor_rows},
+            by_provenance={
+                row["category"]: int(row["count"]) for row in provenance_rows
+            },
+        )
+
+    def recent_observation_metadata(
+        self,
+        *,
+        limit: int,
+        actor_id: str | None = None,
+        provenance: ObservationProvenance | None = None,
+        method: str | None = None,
+        response_status: int | None = None,
+    ) -> tuple[ObservationMetadata, ...]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        for column, value in (
+            ("actor_id", actor_id),
+            ("provenance", provenance.value if provenance is not None else None),
+            ("method", method),
+            ("response_status", response_status),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, project_id, observed_at, provenance, actor_id, method, "
+                "url, response_status, LENGTH(raw_request) AS request_size, "
+                f"COALESCE(LENGTH(raw_response), 0) AS response_size FROM observations{where} "
+                "ORDER BY observed_at DESC, id DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return tuple(
+            ObservationMetadata(
+                id=UUID(row["id"]),
+                project_id=UUID(row["project_id"]),
+                observed_at=datetime.fromisoformat(row["observed_at"]),
+                provenance=ObservationProvenance(row["provenance"]),
+                actor_id=row["actor_id"],
+                method=row["method"],
+                url=row["url"],
+                response_status=row["response_status"],
+                request_size=int(row["request_size"]),
+                response_size=int(row["response_size"]),
+            )
+            for row in rows
+        )
+
+    @staticmethod
+    def _observation_from_row(row: sqlite3.Row) -> Observation:
         return Observation(
             id=UUID(row["id"]),
             project_id=UUID(row["project_id"]),
@@ -164,12 +276,12 @@ class SQLiteRepository:
     def list_observations(self) -> tuple[Observation, ...]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT id FROM observations ORDER BY observed_at, id"
+                "SELECT * FROM observations ORDER BY observed_at, id"
             ).fetchall()
-        observations = tuple(self.get_observation(UUID(row["id"])) for row in rows)
-        return tuple(observation for observation in observations if observation is not None)
+        return tuple(self._observation_from_row(row) for row in rows)
 
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
+        self._require_writable()
         with self._connection() as connection:
             connection.execute(
                 "INSERT INTO hypotheses (id, project_id, statement, status) VALUES (?, ?, ?, ?)",
@@ -203,6 +315,7 @@ class SQLiteRepository:
     def add_asset(
         self, body: bytes, observed_url: str, content_encoding: str | None = None
     ) -> Asset:
+        self._require_writable()
         normalized = normalize_response_body(body, content_encoding)
         content_hash = content_sha256(normalized)
         with self._connection() as connection:
@@ -240,3 +353,7 @@ class SQLiteRepository:
             body=bytes(asset_row["body"]),
             observed_urls=tuple(row["url"] for row in url_rows),
         )
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise RuntimeError("repository was opened read-only")

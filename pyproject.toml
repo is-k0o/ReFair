@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "refair"
-version = "0.1.0"
+version = "0.1.5"
 description = "Deterministic foundations for authorized AI-assisted web security research."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 refair-collector = "refair.bridge.__main__:main"
+refair-inspect = "refair.inspect.cli:main"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

@@ -18,6 +18,7 @@ final class HttpCollectorSender implements EventSender {
         this.collectorUri = collectorUri;
         this.client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(1))
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
     }
 

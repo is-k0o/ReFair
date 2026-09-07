@@ -40,3 +40,6 @@ config.local.yaml
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local Burp configuration
+refair-burp-project-settings.json
