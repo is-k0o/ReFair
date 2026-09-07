@@ -118,6 +118,7 @@ def test_list_hides_query_by_default_and_full_url_is_explicit(tmp_path, capsys) 
 
     assert main(["--config", str(config_path), "list", "--limit", "20"]) == 0
     safe_output = capsys.readouterr().out
+    assert str(observations[0].id) in safe_output
     assert "actor_a" in safe_output
     assert "GET" in safe_output
     assert "200" in safe_output
@@ -129,6 +130,19 @@ def test_list_hides_query_by_default_and_full_url_is_explicit(tmp_path, capsys) 
     ) == 0
     full_output = capsys.readouterr().out
     assert observations[0].url in full_output
+
+
+def test_list_uuid_is_directly_usable_with_show(tmp_path, capsys) -> None:
+    config_path, _, observations = seed_database(tmp_path)
+
+    assert main(["--config", str(config_path), "list", "--limit", "1"]) == 0
+    list_output = capsys.readouterr().out.strip()
+    listed_id = list_output.split(maxsplit=1)[0]
+
+    assert listed_id == str(observations[-1].id)
+    assert main(["--config", str(config_path), "show", listed_id]) == 0
+    show_output = capsys.readouterr().out
+    assert f"ID: {listed_id}" in show_output
 
 
 def test_list_limit_and_filters_apply_to_recent_observations(tmp_path, capsys) -> None:

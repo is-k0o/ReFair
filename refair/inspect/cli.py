@@ -148,7 +148,7 @@ def _print_list(repository: SQLiteRepository, arguments: argparse.Namespace) -> 
         status = observation.response_status or "-"
         actor = observation.actor_id or "-"
         print(
-            f"{observation.observed_at.isoformat()}  {actor}  "
+            f"{observation.id}  {observation.observed_at.isoformat()}  {actor}  "
             f"{observation.provenance.value}  {observation.method}  {status}  "
             f"{location}  req={observation.request_size}B  "
             f"resp={observation.response_size}B"
