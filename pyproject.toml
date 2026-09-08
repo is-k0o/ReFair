@@ -25,6 +25,7 @@ dev = [
 [project.scripts]
 refair-collector = "refair.bridge.__main__:main"
 refair-inspect = "refair.inspect.cli:main"
+refair-process = "refair.process.cli:main"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,8 +13,11 @@ from uuid import UUID
 
 from refair.assets.identity import Asset, content_sha256, normalize_response_body
 from refair.models.evidence import Hypothesis, Observation, ObservationProvenance
+from refair.models.normalized import BodyKind, NormalizedExchange
 
-SCHEMA = """
+CURRENT_SCHEMA_VERSION = 1
+
+LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -87,6 +91,44 @@ CREATE TABLE IF NOT EXISTS asset_urls (
 CREATE INDEX IF NOT EXISTS asset_urls_url_idx ON asset_urls(url);
 """
 
+MIGRATIONS = {
+    1: """
+CREATE TABLE normalized_exchanges (
+    observation_id TEXT PRIMARY KEY REFERENCES observations(id),
+    normalizer_version INTEGER NOT NULL CHECK(normalizer_version >= 1),
+    scheme TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER CHECK(port IS NULL OR port BETWEEN 1 AND 65535),
+    path TEXT NOT NULL,
+    query_parameter_names TEXT NOT NULL,
+    raw_query_sha256 TEXT CHECK(
+        raw_query_sha256 IS NULL OR length(raw_query_sha256) = 64
+    ),
+    request_content_type TEXT,
+    request_body_kind TEXT NOT NULL CHECK(
+        request_body_kind IN ('EMPTY', 'JSON', 'FORM', 'MULTIPART', 'TEXT', 'OTHER')
+    ),
+    request_body_size INTEGER NOT NULL CHECK(request_body_size >= 0),
+    request_body_sha256 TEXT CHECK(
+        request_body_sha256 IS NULL OR length(request_body_sha256) = 64
+    ),
+    response_content_type TEXT,
+    response_body_kind TEXT NOT NULL CHECK(
+        response_body_kind IN ('EMPTY', 'JSON', 'FORM', 'MULTIPART', 'TEXT', 'OTHER')
+    ),
+    response_body_size INTEGER NOT NULL CHECK(response_body_size >= 0),
+    response_body_sha256 TEXT CHECK(
+        response_body_sha256 IS NULL OR length(response_body_sha256) = 64
+    ),
+    warnings TEXT NOT NULL
+);
+""",
+}
+
+
+class UnsupportedSchemaVersionError(RuntimeError):
+    """Raised when a database was created by newer ReFair code."""
+
 
 @dataclass(frozen=True)
 class ObservationSummary:
@@ -126,6 +168,12 @@ class SQLiteRepository:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > CURRENT_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersionError(
+                    f"database schema version {version} is newer than supported "
+                    f"version {CURRENT_SCHEMA_VERSION}"
+                )
             yield connection
             if not self.read_only:
                 connection.commit()
@@ -138,7 +186,18 @@ class SQLiteRepository:
     def initialize(self) -> None:
         self._require_writable()
         with self._connection() as connection:
-            connection.executescript(SCHEMA)
+            current_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            scripts = ["BEGIN IMMEDIATE;"]
+            if current_version == 0:
+                scripts.append(LEGACY_SCHEMA)
+            for version in range(current_version + 1, CURRENT_SCHEMA_VERSION + 1):
+                scripts.append(MIGRATIONS[version])
+                scripts.append(f"PRAGMA user_version = {version};")
+            scripts.append("COMMIT;")
+            if len(scripts) > 2:
+                connection.executescript("\n".join(scripts))
 
     def add_observation(self, observation: Observation) -> Observation:
         self._require_writable()
@@ -279,6 +338,120 @@ class SQLiteRepository:
                 "SELECT * FROM observations ORDER BY observed_at, id"
             ).fetchall()
         return tuple(self._observation_from_row(row) for row in rows)
+
+    def add_normalized_exchange(
+        self, exchange: NormalizedExchange
+    ) -> NormalizedExchange:
+        self._require_writable()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO normalized_exchanges (
+                    observation_id, normalizer_version, scheme, host, port, path,
+                    query_parameter_names, raw_query_sha256, request_content_type,
+                    request_body_kind, request_body_size, request_body_sha256,
+                    response_content_type, response_body_kind, response_body_size,
+                    response_body_sha256, warnings
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observation_id) DO NOTHING
+                """,
+                (
+                    str(exchange.observation_id),
+                    exchange.normalizer_version,
+                    exchange.scheme,
+                    exchange.host,
+                    exchange.port,
+                    exchange.path,
+                    json.dumps(exchange.query_parameter_names, separators=(",", ":")),
+                    exchange.raw_query_sha256,
+                    exchange.request_content_type,
+                    exchange.request_body_kind.value,
+                    exchange.request_body_size,
+                    exchange.request_body_sha256,
+                    exchange.response_content_type,
+                    exchange.response_body_kind.value,
+                    exchange.response_body_size,
+                    exchange.response_body_sha256,
+                    json.dumps(exchange.warnings, separators=(",", ":")),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM normalized_exchanges WHERE observation_id = ?",
+                (str(exchange.observation_id),),
+            ).fetchone()
+        assert row is not None
+        return self._normalized_exchange_from_row(row)
+
+    def get_normalized_exchange(
+        self, observation_id: UUID
+    ) -> NormalizedExchange | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM normalized_exchanges WHERE observation_id = ?",
+                (str(observation_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._normalized_exchange_from_row(row)
+
+    @staticmethod
+    def _normalized_exchange_from_row(row: sqlite3.Row) -> NormalizedExchange:
+        return NormalizedExchange(
+            observation_id=UUID(row["observation_id"]),
+            normalizer_version=int(row["normalizer_version"]),
+            scheme=row["scheme"],
+            host=row["host"],
+            port=row["port"],
+            path=row["path"],
+            query_parameter_names=tuple(json.loads(row["query_parameter_names"])),
+            raw_query_sha256=row["raw_query_sha256"],
+            request_content_type=row["request_content_type"],
+            request_body_kind=BodyKind(row["request_body_kind"]),
+            request_body_size=int(row["request_body_size"]),
+            request_body_sha256=row["request_body_sha256"],
+            response_content_type=row["response_content_type"],
+            response_body_kind=BodyKind(row["response_body_kind"]),
+            response_body_size=int(row["response_body_size"]),
+            response_body_sha256=row["response_body_sha256"],
+            warnings=tuple(json.loads(row["warnings"])),
+        )
+
+    def count_normalized_exchanges(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM normalized_exchanges"
+            ).fetchone()
+        assert row is not None
+        return int(row["count"])
+
+    def list_pending_observations(
+        self, *, limit: int | None = None
+    ) -> tuple[Observation, ...]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        parameters: tuple[int, ...] = () if limit is None else (limit,)
+        limit_clause = "" if limit is None else " LIMIT ?"
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT observations.* FROM observations "
+                "LEFT JOIN normalized_exchanges ON "
+                "normalized_exchanges.observation_id = observations.id "
+                "WHERE normalized_exchanges.observation_id IS NULL "
+                f"ORDER BY observations.observed_at, observations.id{limit_clause}",
+                parameters,
+            ).fetchall()
+        return tuple(self._observation_from_row(row) for row in rows)
+
+    def count_pending_observations(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM observations "
+                "LEFT JOIN normalized_exchanges ON "
+                "normalized_exchanges.observation_id = observations.id "
+                "WHERE normalized_exchanges.observation_id IS NULL"
+            ).fetchone()
+        assert row is not None
+        return int(row["count"])
 
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
         self._require_writable()

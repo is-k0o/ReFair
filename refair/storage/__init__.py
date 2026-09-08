@@ -1,5 +1,17 @@
 """Persistence API."""
 
-from refair.storage.sqlite import ObservationMetadata, ObservationSummary, SQLiteRepository
+from refair.storage.sqlite import (
+    CURRENT_SCHEMA_VERSION,
+    ObservationMetadata,
+    ObservationSummary,
+    SQLiteRepository,
+    UnsupportedSchemaVersionError,
+)
 
-__all__ = ["ObservationMetadata", "ObservationSummary", "SQLiteRepository"]
+__all__ = [
+    "CURRENT_SCHEMA_VERSION",
+    "ObservationMetadata",
+    "ObservationSummary",
+    "SQLiteRepository",
+    "UnsupportedSchemaVersionError",
+]

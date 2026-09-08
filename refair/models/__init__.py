@@ -24,6 +24,7 @@ from refair.models.experiment import (
     PolicyDecision,
     PolicyOutcome,
 )
+from refair.models.normalized import BodyKind, NormalizedExchange
 from refair.models.project import Actor, Project, TenantKnowledge
 from refair.models.state import RunState, RunStatus
 
@@ -31,6 +32,7 @@ __all__ = [
     "Actor",
     "ApiBudgetLimits",
     "ApiUsage",
+    "BodyKind",
     "Endpoint",
     "Entity",
     "EntityClaim",
@@ -43,6 +45,7 @@ __all__ = [
     "HypothesisStatus",
     "Observation",
     "ObservationProvenance",
+    "NormalizedExchange",
     "PolicyDecision",
     "PolicyOutcome",
     "Project",

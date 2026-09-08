@@ -13,8 +13,8 @@ state transitions.
 
 ## V0.1.5
 
-This repository provides the deterministic foundation plus the first passive
-Burp/Montoya ingestion bridge:
+This repository provides the deterministic foundation, the first passive
+Burp/Montoya ingestion bridge, and the bounded V0.2-A normalization slice:
 
 - typed Pydantic models for projects, actors, evidence, interpretations,
   experiments, policy outcomes, budgets, usage, and run state;
@@ -30,12 +30,15 @@ Burp/Montoya ingestion bridge:
   serializes exact request/response bytes with base64, and hands events to a
   bounded asynchronous HTTP/1.1 transport worker;
 - a read-only command-line inspector for safe summaries, recent observation
-  metadata, and explicitly bounded raw previews.
+  metadata, and explicitly bounded raw previews;
+- a separate deterministic processor that projects immutable observations into
+  value-free URL, content-type, body-kind, size, and SHA-256 metadata.
 
 V0.1.5 does **not** generate active traffic, crawl, scan, exploit, automate a
-browser, call an LLM or Burp AI, use MCP/RAG/vector storage, normalize traffic,
-extract endpoints, provide a UI, or implement multi-agent behavior. It does not
-yet contain a complete scope or authorization policy engine.
+browser, call an LLM or Burp AI, use MCP/RAG/vector storage, aggregate or infer
+endpoints, provide a UI, or implement multi-agent behavior. It does not yet
+contain a complete scope or authorization policy engine. The public package
+version remains V0.1.5 while this internal V0.2-A slice is developed.
 
 The bridge is passive and fail-open relative to browser traffic. Burp callbacks
 never wait for the collector. Events enter a bounded in-memory queue and receive
@@ -58,6 +61,9 @@ Firefox
   -> Python collector
   -> immutable Observation
   -> SQLite
+
+Separate operator command:
+  SQLite -> deterministic normalizer -> NormalizedExchange
 ```
 
 The Java envelope contains the listener port and raw messages, but no trusted
@@ -76,6 +82,7 @@ refair/
   assets/       content-based static asset identity
   bridge/       strict passive collector transport and CLI
   inspect/      read-only observation inspection CLI
+  process/      out-of-band deterministic normalization CLI
   models/       domain, budget, experiment, and run-state models
   policy/       deterministic budget and active-concurrency controls
   storage/      explicit SQLite schema and repository
@@ -144,6 +151,26 @@ refair-inspect --config config.example.yaml show <observation-uuid> --raw-previe
 
 This is bounded presentation, not redaction; immutable stored evidence is never
 changed.
+
+## Process normalized exchanges
+
+Normalization runs outside the passive collector and reads the same configured
+SQLite path:
+
+```powershell
+refair-process --config config.example.yaml
+```
+
+The equivalent module form is `python -m refair.process`. The command migrates a
+legacy V0.1.5 database to schema version 1, processes only observations without a
+normalized row, and prints processed, pending, and warning counts. Re-running it
+after all observations are processed reports zero newly processed observations.
+
+Normalized rows contain URL components, ordered query parameter names, exact raw
+query/body hashes, normalized content types, body kinds, sizes, and parser
+warnings. They do not duplicate raw HTTP, header secrets, query values, form
+values, JSON values, or response contents. Raw `Observation` rows remain the
+immutable source of truth.
 
 ## Manual smoke test
 
