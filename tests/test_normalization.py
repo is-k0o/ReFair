@@ -56,14 +56,32 @@ def test_url_components_are_normalized_conservatively(
 
 def test_query_names_preserve_order_and_duplicates_without_values() -> None:
     normalized = normalize_observation(
-        observation_for(url="https://example.test/items?id=alpha&id=beta&type=x")
+        observation_for(
+            url=(
+                "https://example.test/items?"
+                "id=value-one&%69d=value-two&a+b=value-three&"
+                "a%20b=value-four&id=value-five"
+            )
+        )
     )
 
-    assert normalized.query_parameter_names == ("id", "id", "type")
+    assert normalized.query_parameter_names == (
+        "id",
+        "%69d",
+        "a+b",
+        "a%20b",
+        "id",
+    )
     serialized = normalized.model_dump_json()
-    assert "alpha" not in serialized
-    assert "beta" not in serialized
-    assert '"x"' not in serialized
+    values = (
+        "value-one",
+        "value-two",
+        "value-three",
+        "value-four",
+        "value-five",
+    )
+    for value in values:
+        assert value not in serialized
 
 
 def test_exact_raw_query_variants_have_different_hashes() -> None:
@@ -77,6 +95,16 @@ def test_exact_raw_query_variants_have_different_hashes() -> None:
     assert first.query_parameter_names == second.query_parameter_names
     assert first.raw_query_sha256 != second.raw_query_sha256
     assert first.raw_query_sha256 == sha256(b"id=1&type=x").hexdigest()
+
+    raw_name = normalize_observation(
+        observation_for(url="https://example.test/items?id=1")
+    )
+    encoded_name = normalize_observation(
+        observation_for(url="https://example.test/items?%69d=1")
+    )
+    assert raw_name.query_parameter_names == ("id",)
+    assert encoded_name.query_parameter_names == ("%69d",)
+    assert raw_name.raw_query_sha256 != encoded_name.raw_query_sha256
 
     empty_query = normalize_observation(
         observation_for(url="https://example.test/items?")
@@ -135,7 +163,7 @@ def test_response_body_metadata_hashes_exact_bytes_and_keeps_no_raw_copy() -> No
         )
     )
 
-    assert normalized.normalizer_version == NORMALIZER_VERSION == 1
+    assert normalized.normalizer_version == NORMALIZER_VERSION == 2
     assert normalized.request_content_type == "application/json"
     assert normalized.response_content_type == "text/plain"
     assert normalized.response_body_kind is BodyKind.TEXT
@@ -173,14 +201,53 @@ def test_normalized_storage_is_deterministic_and_idempotent(tmp_path) -> None:
     repository = SQLiteRepository(tmp_path / "refair.sqlite3")
     repository.initialize()
     observation = repository.add_observation(
-        observation_for(url="https://example.test/items?id=1&id=2")
+        observation_for(url="https://example.test/items?%69d=1&id=2")
     )
 
-    first = normalize_observation(observation)
-    second = normalize_observation(observation)
+    version_two = normalize_observation(observation)
+    version_one = version_two.model_copy(
+        update={"normalizer_version": 1, "query_parameter_names": ("id", "id")}
+    )
 
-    assert first == second
-    assert repository.add_normalized_exchange(first) == first
-    assert repository.add_normalized_exchange(second) == first
+    assert repository.add_normalized_exchange(version_one) == version_one
+    assert repository.add_normalized_exchange(version_two) == version_two
+    assert repository.add_normalized_exchange(version_two) == version_two
     assert repository.count_normalized_exchanges() == 1
-    assert repository.get_normalized_exchange(observation.id) == first
+    assert repository.get_normalized_exchange(observation.id) == version_two
+
+    version_three = version_two.model_copy(
+        update={"normalizer_version": 3, "query_parameter_names": ("future",)}
+    )
+    assert repository.add_normalized_exchange(version_three) == version_three
+    assert repository.add_normalized_exchange(version_two) == version_three
+    assert repository.get_normalized_exchange(observation.id) == version_three
+    assert repository.count_normalized_exchanges() == 1
+
+
+def test_pending_detection_is_relative_to_target_normalizer_version(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "refair.sqlite3")
+    repository.initialize()
+    observations = tuple(
+        repository.add_observation(
+            observation_for(url=f"https://example.test/items/{index}")
+        )
+        for index in range(4)
+    )
+    normalized = tuple(normalize_observation(item) for item in observations)
+    repository.add_normalized_exchange(
+        normalized[1].model_copy(update={"normalizer_version": 1})
+    )
+    repository.add_normalized_exchange(normalized[2])
+    repository.add_normalized_exchange(
+        normalized[3].model_copy(update={"normalizer_version": 3})
+    )
+
+    pending = repository.list_pending_observations(target_normalizer_version=2)
+
+    assert {item.id for item in pending} == {observations[0].id, observations[1].id}
+    assert repository.count_pending_observations(target_normalizer_version=2) == 2
+    assert len(
+        repository.list_pending_observations(
+            target_normalizer_version=2, limit=1
+        )
+    ) == 1

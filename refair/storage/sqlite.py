@@ -353,7 +353,25 @@ class SQLiteRepository:
                     response_content_type, response_body_kind, response_body_size,
                     response_body_sha256, warnings
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(observation_id) DO NOTHING
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    normalizer_version = excluded.normalizer_version,
+                    scheme = excluded.scheme,
+                    host = excluded.host,
+                    port = excluded.port,
+                    path = excluded.path,
+                    query_parameter_names = excluded.query_parameter_names,
+                    raw_query_sha256 = excluded.raw_query_sha256,
+                    request_content_type = excluded.request_content_type,
+                    request_body_kind = excluded.request_body_kind,
+                    request_body_size = excluded.request_body_size,
+                    request_body_sha256 = excluded.request_body_sha256,
+                    response_content_type = excluded.response_content_type,
+                    response_body_kind = excluded.response_body_kind,
+                    response_body_size = excluded.response_body_size,
+                    response_body_sha256 = excluded.response_body_sha256,
+                    warnings = excluded.warnings
+                WHERE normalized_exchanges.normalizer_version
+                    < excluded.normalizer_version
                 """,
                 (
                     str(exchange.observation_id),
@@ -425,11 +443,17 @@ class SQLiteRepository:
         return int(row["count"])
 
     def list_pending_observations(
-        self, *, limit: int | None = None
+        self, *, target_normalizer_version: int, limit: int | None = None
     ) -> tuple[Observation, ...]:
+        if target_normalizer_version < 1:
+            raise ValueError("target normalizer version must be positive")
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
-        parameters: tuple[int, ...] = () if limit is None else (limit,)
+        parameters = (
+            (target_normalizer_version,)
+            if limit is None
+            else (target_normalizer_version, limit)
+        )
         limit_clause = "" if limit is None else " LIMIT ?"
         with self._connection() as connection:
             rows = connection.execute(
@@ -437,18 +461,23 @@ class SQLiteRepository:
                 "LEFT JOIN normalized_exchanges ON "
                 "normalized_exchanges.observation_id = observations.id "
                 "WHERE normalized_exchanges.observation_id IS NULL "
+                "OR normalized_exchanges.normalizer_version < ? "
                 f"ORDER BY observations.observed_at, observations.id{limit_clause}",
                 parameters,
             ).fetchall()
         return tuple(self._observation_from_row(row) for row in rows)
 
-    def count_pending_observations(self) -> int:
+    def count_pending_observations(self, *, target_normalizer_version: int) -> int:
+        if target_normalizer_version < 1:
+            raise ValueError("target normalizer version must be positive")
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM observations "
                 "LEFT JOIN normalized_exchanges ON "
                 "normalized_exchanges.observation_id = observations.id "
-                "WHERE normalized_exchanges.observation_id IS NULL"
+                "WHERE normalized_exchanges.observation_id IS NULL "
+                "OR normalized_exchanges.normalizer_version < ?",
+                (target_normalizer_version,),
             ).fetchone()
         assert row is not None
         return int(row["count"])

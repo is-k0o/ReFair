@@ -162,9 +162,10 @@ refair-process --config config.example.yaml
 ```
 
 The equivalent module form is `python -m refair.process`. The command migrates a
-legacy V0.1.5 database to schema version 1, processes only observations without a
-normalized row, and prints processed, pending, and warning counts. Re-running it
-after all observations are processed reports zero newly processed observations.
+legacy V0.1.5 database to schema version 1, then processes missing or stale
+normalized rows in bounded batches. Derived rows are reprocessed only for a
+newer normalizer version. The command prints processed, pending, and warning
+counts; an immediate second run reports zero newly processed observations.
 
 Normalized rows contain URL components, ordered query parameter names, exact raw
 query/body hashes, normalized content types, body kinds, sizes, and parser

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from urllib.parse import unquote_plus, urlsplit
+from urllib.parse import urlsplit
 
 from refair.models.evidence import Observation
 from refair.models.normalized import BodyKind, NormalizedExchange
 
-NORMALIZER_VERSION = 1
+NORMALIZER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -119,7 +119,7 @@ def normalize_observation(observation: Observation) -> NormalizedExchange:
     raw_query = observation.url.partition("#")[0].partition("?")
     query_text = raw_query[2] if raw_query[1] else ""
     query_names = (
-        tuple(unquote_plus(item.partition("=")[0]) for item in query_text.split("&"))
+        tuple(item.partition("=")[0] for item in query_text.split("&"))
         if query_text
         else ()
     )

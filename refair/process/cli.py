@@ -9,8 +9,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from refair.config import load_config
-from refair.normalization import normalize_observation
+from refair.normalization import NORMALIZER_VERSION, normalize_observation
 from refair.storage import SQLiteRepository
+
+PROCESS_BATCH_SIZE = 250
 
 
 @dataclass(frozen=True)
@@ -23,14 +25,20 @@ class ProcessResult:
 def process_pending(repository: SQLiteRepository) -> ProcessResult:
     processed = 0
     warning_count = 0
-    for observation in repository.list_pending_observations():
-        exchange = normalize_observation(observation)
-        repository.add_normalized_exchange(exchange)
-        processed += 1
-        warning_count += len(exchange.warnings)
+    while batch := repository.list_pending_observations(
+        target_normalizer_version=NORMALIZER_VERSION,
+        limit=PROCESS_BATCH_SIZE,
+    ):
+        for observation in batch:
+            exchange = normalize_observation(observation)
+            repository.add_normalized_exchange(exchange)
+            processed += 1
+            warning_count += len(exchange.warnings)
     return ProcessResult(
         processed=processed,
-        pending=repository.count_pending_observations(),
+        pending=repository.count_pending_observations(
+            target_normalizer_version=NORMALIZER_VERSION
+        ),
         warnings=warning_count,
     )
 
