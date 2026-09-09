@@ -260,7 +260,7 @@ def test_structural_processing_is_idempotent_and_version_aware(tmp_path) -> None
     )
     extraction = extract_structure(observation, normalized)
 
-    assert extraction.structural_version == STRUCTURAL_VERSION == 1
+    assert extraction.structural_version == STRUCTURAL_VERSION == 2
     assert repository.add_structural_extraction(extraction)
     assert not repository.add_structural_extraction(extraction)
     counts = (
@@ -271,17 +271,17 @@ def test_structural_processing_is_idempotent_and_version_aware(tmp_path) -> None
     )
     assert counts == (1, 1, 1, 2)
     assert repository.count_pending_structural_observations(
-        target_structural_version=1
+        target_structural_version=2
     ) == 0
     assert repository.count_pending_structural_observations(
-        target_structural_version=2
+        target_structural_version=3
     ) == 1
 
-    newer = replace(extraction, structural_version=2)
+    newer = replace(extraction, structural_version=3)
     assert repository.add_structural_extraction(newer)
     assert not repository.add_structural_extraction(extraction)
     assert repository.count_pending_structural_observations(
-        target_structural_version=1
+        target_structural_version=2
     ) == 0
     assert (
         repository.count_exact_endpoints(),

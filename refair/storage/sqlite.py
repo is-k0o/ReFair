@@ -18,15 +18,22 @@ from refair.models.structure import (
     ActorOutcome,
     ExactEndpoint,
     HttpOperation,
+    JsonArrayItem,
+    JsonDirection,
+    JsonParseStatus,
+    JsonPath,
+    JsonType,
     MethodAdvertisement,
     MethodAdvertisementSource,
+    OperationJsonDocumentOutcome,
+    OperationJsonField,
     OperationQueryShape,
     RequestRepresentation,
     ResponseRepresentation,
 )
 from refair.structure import StructuralExtraction
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -179,6 +186,42 @@ CREATE TABLE structural_processing (
     structural_version INTEGER NOT NULL CHECK(structural_version >= 1)
 );
 """,
+    3: """
+CREATE TABLE json_documents (
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    direction TEXT NOT NULL CHECK(direction IN ('REQUEST', 'RESPONSE')),
+    parse_status TEXT NOT NULL CHECK(
+        parse_status IN ('PARSED', 'MALFORMED', 'SKIPPED_TOO_LARGE', 'LIMIT_EXCEEDED')
+    ),
+    root_type TEXT CHECK(
+        root_type IS NULL OR
+        root_type IN ('OBJECT', 'ARRAY', 'STRING', 'NUMBER', 'BOOLEAN', 'NULL')
+    ),
+    CHECK(
+        (parse_status = 'PARSED' AND root_type IS NOT NULL) OR
+        (parse_status != 'PARSED' AND root_type IS NULL)
+    ),
+    PRIMARY KEY (observation_id, direction)
+);
+
+CREATE TABLE json_field_observations (
+    observation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    path TEXT NOT NULL,
+    json_type TEXT NOT NULL CHECK(
+        json_type IN ('OBJECT', 'ARRAY', 'STRING', 'NUMBER', 'BOOLEAN', 'NULL')
+    ),
+    duplicate_key_observed INTEGER NOT NULL CHECK(
+        duplicate_key_observed IN (0, 1)
+    ),
+    PRIMARY KEY (observation_id, direction, path, json_type),
+    FOREIGN KEY (observation_id, direction)
+        REFERENCES json_documents(observation_id, direction) ON DELETE CASCADE
+);
+
+CREATE INDEX json_field_observations_operation_join_idx
+ON json_field_observations(observation_id, direction);
+""",
 }
 
 
@@ -205,6 +248,21 @@ class ObservationMetadata:
     response_status: int | None
     request_size: int
     response_size: int
+
+
+def _serialize_json_path(path: JsonPath) -> str:
+    return json.dumps(
+        [None if segment is JsonArrayItem.ITEM else segment for segment in path],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_json_path(value: str) -> JsonPath:
+    segments = json.loads(value)
+    return tuple(
+        JsonArrayItem.ITEM if segment is None else segment for segment in segments
+    )
 
 
 class SQLiteRepository:
@@ -601,6 +659,21 @@ class SQLiteRepository:
             for advertisement in extraction.advertisements
         ):
             raise ValueError("advertisement does not belong to extraction")
+        document_keys = {
+            (document.observation_id, document.direction)
+            for document in extraction.json_documents
+        }
+        if any(
+            document.observation_id != extraction.observation_id
+            for document in extraction.json_documents
+        ):
+            raise ValueError("JSON document does not belong to extraction")
+        if any(
+            field.observation_id != extraction.observation_id
+            or (field.observation_id, field.direction) not in document_keys
+            for field in extraction.json_fields
+        ):
+            raise ValueError("JSON field does not belong to extraction document")
 
         with self._connection() as connection:
             existing = connection.execute(
@@ -669,6 +742,48 @@ class SQLiteRepository:
                         str(item.observation_id),
                     )
                     for item in extraction.advertisements
+                ],
+            )
+            connection.execute(
+                "DELETE FROM json_field_observations WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.execute(
+                "DELETE FROM json_documents WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.executemany(
+                """
+                INSERT INTO json_documents (
+                    observation_id, direction, parse_status, root_type
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        item.parse_status.value,
+                        item.root_type.value if item.root_type is not None else None,
+                    )
+                    for item in extraction.json_documents
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO json_field_observations (
+                    observation_id, direction, path, json_type,
+                    duplicate_key_observed
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        _serialize_json_path(item.path),
+                        item.json_type.value,
+                        int(item.duplicate_key_observed),
+                    )
+                    for item in extraction.json_fields
                 ],
             )
             connection.execute(
@@ -755,12 +870,20 @@ class SQLiteRepository:
     def count_method_advertisements(self) -> int:
         return self._table_count("method_advertisements")
 
+    def count_json_documents(self) -> int:
+        return self._table_count("json_documents")
+
+    def count_json_field_observations(self) -> int:
+        return self._table_count("json_field_observations")
+
     def _table_count(self, table: str) -> int:
         allowed = {
             "exact_endpoints",
             "http_operations",
             "operation_observations",
             "method_advertisements",
+            "json_documents",
+            "json_field_observations",
         }
         if table not in allowed:
             raise ValueError("unsupported structural table")
@@ -887,6 +1010,76 @@ class SQLiteRepository:
                 provenance=ObservationProvenance(row["provenance"]),
                 response_status=row["response_status"],
                 observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_json_document_outcomes(
+        self, operation_id: UUID
+    ) -> tuple[OperationJsonDocumentOutcome, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT json_documents.direction, json_documents.parse_status,
+                       json_documents.root_type, COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN json_documents ON json_documents.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY json_documents.direction, json_documents.parse_status,
+                         json_documents.root_type
+                ORDER BY json_documents.direction, json_documents.parse_status,
+                         json_documents.root_type
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationJsonDocumentOutcome(
+                direction=JsonDirection(row["direction"]),
+                parse_status=JsonParseStatus(row["parse_status"]),
+                root_type=(
+                    JsonType(row["root_type"])
+                    if row["root_type"] is not None
+                    else None
+                ),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_json_fields(
+        self, operation_id: UUID
+    ) -> tuple[OperationJsonField, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT json_field_observations.direction,
+                       json_field_observations.path,
+                       json_field_observations.json_type,
+                       COUNT(*) AS observation_count,
+                       MAX(json_field_observations.duplicate_key_observed)
+                           AS duplicate_key_observed
+                FROM operation_observations
+                JOIN json_field_observations ON
+                    json_field_observations.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY json_field_observations.direction,
+                         json_field_observations.path,
+                         json_field_observations.json_type
+                ORDER BY json_field_observations.direction,
+                         json_field_observations.path,
+                         json_field_observations.json_type
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationJsonField(
+                direction=JsonDirection(row["direction"]),
+                path=_deserialize_json_path(row["path"]),
+                json_type=JsonType(row["json_type"]),
+                observation_count=int(row["observation_count"]),
+                duplicate_key_observed=bool(row["duplicate_key_observed"]),
             )
             for row in rows
         )

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum, StrEnum
+from typing import Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from refair.models.evidence import ObservationProvenance
 from refair.models.normalized import BodyKind
@@ -48,6 +49,86 @@ class MethodAdvertisement(BaseModel):
     source: MethodAdvertisementSource
     advertised_method: str = Field(min_length=1)
     observation_id: UUID
+
+
+class JsonDirection(StrEnum):
+    REQUEST = "REQUEST"
+    RESPONSE = "RESPONSE"
+
+
+class JsonType(StrEnum):
+    OBJECT = "OBJECT"
+    ARRAY = "ARRAY"
+    STRING = "STRING"
+    NUMBER = "NUMBER"
+    BOOLEAN = "BOOLEAN"
+    NULL = "NULL"
+
+
+class JsonParseStatus(StrEnum):
+    PARSED = "PARSED"
+    MALFORMED = "MALFORMED"
+    SKIPPED_TOO_LARGE = "SKIPPED_TOO_LARGE"
+    LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+
+
+class JsonArrayItem(Enum):
+    """Typed JSON path segment representing any array element."""
+
+    ITEM = "ARRAY_ITEM"
+
+
+JsonPath = tuple[str | JsonArrayItem, ...]
+
+
+class JsonDocument(BaseModel):
+    """Value-free parse result for one JSON request or response body."""
+
+    model_config = ConfigDict(frozen=True)
+
+    observation_id: UUID
+    direction: JsonDirection
+    parse_status: JsonParseStatus
+    root_type: JsonType | None = None
+
+    @model_validator(mode="after")
+    def root_type_matches_parse_status(self) -> Self:
+        if (self.parse_status is JsonParseStatus.PARSED) != (
+            self.root_type is not None
+        ):
+            raise ValueError("root type must be present exactly when JSON was parsed")
+        return self
+
+
+class JsonFieldObservation(BaseModel):
+    """One evidence-backed JSON path/type fact without its scalar value."""
+
+    model_config = ConfigDict(frozen=True)
+
+    observation_id: UUID
+    direction: JsonDirection
+    path: JsonPath = Field(min_length=1)
+    json_type: JsonType
+    duplicate_key_observed: bool = False
+
+
+class OperationJsonDocumentOutcome(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    direction: JsonDirection
+    parse_status: JsonParseStatus
+    root_type: JsonType | None = None
+    observation_count: int = Field(ge=1)
+
+
+class OperationJsonField(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    direction: JsonDirection
+    path: JsonPath = Field(min_length=1)
+    json_type: JsonType
+    observation_count: int = Field(ge=1)
+    duplicate_key_observed: bool = False
 
 
 class OperationQueryShape(BaseModel):
