@@ -14,8 +14,19 @@ from uuid import UUID
 from refair.assets.identity import Asset, content_sha256, normalize_response_body
 from refair.models.evidence import Hypothesis, Observation, ObservationProvenance
 from refair.models.normalized import BodyKind, NormalizedExchange
+from refair.models.structure import (
+    ActorOutcome,
+    ExactEndpoint,
+    HttpOperation,
+    MethodAdvertisement,
+    MethodAdvertisementSource,
+    OperationQueryShape,
+    RequestRepresentation,
+    ResponseRepresentation,
+)
+from refair.structure import StructuralExtraction
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -121,6 +132,51 @@ CREATE TABLE normalized_exchanges (
         response_body_sha256 IS NULL OR length(response_body_sha256) = 64
     ),
     warnings TEXT NOT NULL
+);
+""",
+    2: """
+CREATE TABLE exact_endpoints (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER CHECK(port IS NULL OR port BETWEEN 1 AND 65535),
+    path TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX exact_endpoints_identity_idx ON exact_endpoints (
+    project_id, scheme, host, COALESCE(port, 0), path
+);
+
+CREATE TABLE http_operations (
+    id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL REFERENCES exact_endpoints(id),
+    method TEXT NOT NULL,
+    UNIQUE(endpoint_id, method)
+);
+
+CREATE TABLE operation_observations (
+    observation_id TEXT PRIMARY KEY REFERENCES observations(id),
+    operation_id TEXT NOT NULL REFERENCES http_operations(id)
+);
+
+CREATE INDEX operation_observations_operation_idx
+ON operation_observations(operation_id);
+
+CREATE TABLE method_advertisements (
+    endpoint_id TEXT NOT NULL REFERENCES exact_endpoints(id),
+    source TEXT NOT NULL CHECK(source IN ('ALLOW_HEADER', 'CORS_ALLOW_METHODS')),
+    advertised_method TEXT NOT NULL CHECK(length(advertised_method) > 0),
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    PRIMARY KEY (endpoint_id, source, advertised_method, observation_id)
+);
+
+CREATE INDEX method_advertisements_observation_idx
+ON method_advertisements(observation_id);
+
+CREATE TABLE structural_processing (
+    observation_id TEXT PRIMARY KEY REFERENCES observations(id),
+    structural_version INTEGER NOT NULL CHECK(structural_version >= 1)
 );
 """,
 }
@@ -481,6 +537,359 @@ class SQLiteRepository:
             ).fetchone()
         assert row is not None
         return int(row["count"])
+
+    def list_pending_structural_inputs(
+        self, *, target_structural_version: int, limit: int | None = None
+    ) -> tuple[tuple[Observation, NormalizedExchange], ...]:
+        if target_structural_version < 1:
+            raise ValueError("target structural version must be positive")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        parameters = (
+            (target_structural_version,)
+            if limit is None
+            else (target_structural_version, limit)
+        )
+        limit_clause = "" if limit is None else " LIMIT ?"
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT observations.*, normalized_exchanges.* "
+                "FROM observations JOIN normalized_exchanges ON "
+                "normalized_exchanges.observation_id = observations.id "
+                "LEFT JOIN structural_processing ON "
+                "structural_processing.observation_id = observations.id "
+                "WHERE structural_processing.observation_id IS NULL "
+                "OR structural_processing.structural_version < ? "
+                f"ORDER BY observations.observed_at, observations.id{limit_clause}",
+                parameters,
+            ).fetchall()
+        return tuple(
+            (self._observation_from_row(row), self._normalized_exchange_from_row(row))
+            for row in rows
+        )
+
+    def count_pending_structural_observations(
+        self, *, target_structural_version: int
+    ) -> int:
+        if target_structural_version < 1:
+            raise ValueError("target structural version must be positive")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM observations "
+                "JOIN normalized_exchanges ON "
+                "normalized_exchanges.observation_id = observations.id "
+                "LEFT JOIN structural_processing ON "
+                "structural_processing.observation_id = observations.id "
+                "WHERE structural_processing.observation_id IS NULL "
+                "OR structural_processing.structural_version < ?",
+                (target_structural_version,),
+            ).fetchone()
+        assert row is not None
+        return int(row["count"])
+
+    def add_structural_extraction(self, extraction: StructuralExtraction) -> bool:
+        """Persist newer derived structure atomically; never downgrade it."""
+
+        self._require_writable()
+        if extraction.structural_version < 1:
+            raise ValueError("structural version must be positive")
+        if extraction.operation.endpoint_id != extraction.endpoint.id:
+            raise ValueError("operation does not belong to endpoint")
+        if any(
+            advertisement.endpoint_id != extraction.endpoint.id
+            or advertisement.observation_id != extraction.observation_id
+            for advertisement in extraction.advertisements
+        ):
+            raise ValueError("advertisement does not belong to extraction")
+
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT structural_version FROM structural_processing "
+                "WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            ).fetchone()
+            if (
+                existing is not None
+                and int(existing["structural_version"])
+                >= extraction.structural_version
+            ):
+                return False
+
+            endpoint = extraction.endpoint
+            connection.execute(
+                """
+                INSERT INTO exact_endpoints (
+                    id, project_id, scheme, host, port, path
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    str(endpoint.id),
+                    str(endpoint.project_id),
+                    endpoint.scheme,
+                    endpoint.host,
+                    endpoint.port,
+                    endpoint.path,
+                ),
+            )
+            operation = extraction.operation
+            connection.execute(
+                """
+                INSERT INTO http_operations (id, endpoint_id, method)
+                VALUES (?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (str(operation.id), str(operation.endpoint_id), operation.method),
+            )
+            connection.execute(
+                """
+                INSERT INTO operation_observations (observation_id, operation_id)
+                VALUES (?, ?)
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    operation_id = excluded.operation_id
+                """,
+                (str(extraction.observation_id), str(operation.id)),
+            )
+            connection.execute(
+                "DELETE FROM method_advertisements WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.executemany(
+                """
+                INSERT INTO method_advertisements (
+                    endpoint_id, source, advertised_method, observation_id
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    (
+                        str(item.endpoint_id),
+                        item.source.value,
+                        item.advertised_method,
+                        str(item.observation_id),
+                    )
+                    for item in extraction.advertisements
+                ],
+            )
+            connection.execute(
+                """
+                INSERT INTO structural_processing (
+                    observation_id, structural_version
+                ) VALUES (?, ?)
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    structural_version = excluded.structural_version
+                WHERE structural_processing.structural_version
+                    < excluded.structural_version
+                """,
+                (str(extraction.observation_id), extraction.structural_version),
+            )
+        return True
+
+    @staticmethod
+    def _exact_endpoint_from_row(row: sqlite3.Row) -> ExactEndpoint:
+        return ExactEndpoint(
+            id=UUID(row["id"]),
+            project_id=UUID(row["project_id"]),
+            scheme=row["scheme"],
+            host=row["host"],
+            port=row["port"],
+            path=row["path"],
+        )
+
+    def list_exact_endpoints(self) -> tuple[ExactEndpoint, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM exact_endpoints ORDER BY "
+                "project_id, scheme, host, COALESCE(port, 0), path, id"
+            ).fetchall()
+        return tuple(self._exact_endpoint_from_row(row) for row in rows)
+
+    @staticmethod
+    def _http_operation_from_row(row: sqlite3.Row) -> HttpOperation:
+        return HttpOperation(
+            id=UUID(row["id"]),
+            endpoint_id=UUID(row["endpoint_id"]),
+            method=row["method"],
+        )
+
+    def list_http_operations(
+        self, *, endpoint_id: UUID | None = None
+    ) -> tuple[HttpOperation, ...]:
+        where = "" if endpoint_id is None else " WHERE endpoint_id = ?"
+        parameters = () if endpoint_id is None else (str(endpoint_id),)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM http_operations{where} ORDER BY endpoint_id, method, id",
+                parameters,
+            ).fetchall()
+        return tuple(self._http_operation_from_row(row) for row in rows)
+
+    def list_method_advertisements(
+        self, *, endpoint_id: UUID
+    ) -> tuple[MethodAdvertisement, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM method_advertisements WHERE endpoint_id = ? "
+                "ORDER BY source, advertised_method, observation_id",
+                (str(endpoint_id),),
+            ).fetchall()
+        return tuple(
+            MethodAdvertisement(
+                endpoint_id=UUID(row["endpoint_id"]),
+                source=MethodAdvertisementSource(row["source"]),
+                advertised_method=row["advertised_method"],
+                observation_id=UUID(row["observation_id"]),
+            )
+            for row in rows
+        )
+
+    def count_exact_endpoints(self) -> int:
+        return self._table_count("exact_endpoints")
+
+    def count_http_operations(self) -> int:
+        return self._table_count("http_operations")
+
+    def count_operation_observations(self) -> int:
+        return self._table_count("operation_observations")
+
+    def count_method_advertisements(self) -> int:
+        return self._table_count("method_advertisements")
+
+    def _table_count(self, table: str) -> int:
+        allowed = {
+            "exact_endpoints",
+            "http_operations",
+            "operation_observations",
+            "method_advertisements",
+        }
+        if table not in allowed:
+            raise ValueError("unsupported structural table")
+        with self._connection() as connection:
+            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        assert row is not None
+        return int(row["count"])
+
+    def operation_query_shapes(
+        self, operation_id: UUID
+    ) -> tuple[OperationQueryShape, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT normalized_exchanges.raw_query_sha256 IS NOT NULL
+                           AS query_present,
+                       normalized_exchanges.query_parameter_names,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN normalized_exchanges ON
+                    normalized_exchanges.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY query_present,
+                         normalized_exchanges.query_parameter_names
+                ORDER BY query_present,
+                         normalized_exchanges.query_parameter_names
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationQueryShape(
+                query_present=bool(row["query_present"]),
+                query_parameter_names=tuple(
+                    json.loads(row["query_parameter_names"])
+                ),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_request_representations(
+        self, operation_id: UUID
+    ) -> tuple[RequestRepresentation, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT normalized_exchanges.request_content_type AS content_type,
+                       normalized_exchanges.request_body_kind AS body_kind,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN normalized_exchanges ON
+                    normalized_exchanges.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY content_type, body_kind
+                ORDER BY content_type, body_kind
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            RequestRepresentation(
+                content_type=row["content_type"],
+                body_kind=BodyKind(row["body_kind"]),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_response_representations(
+        self, operation_id: UUID
+    ) -> tuple[ResponseRepresentation, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT observations.response_status,
+                       normalized_exchanges.response_content_type AS content_type,
+                       normalized_exchanges.response_body_kind AS body_kind,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN observations ON observations.id =
+                    operation_observations.observation_id
+                JOIN normalized_exchanges ON normalized_exchanges.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY observations.response_status, content_type, body_kind
+                ORDER BY observations.response_status, content_type, body_kind
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            ResponseRepresentation(
+                response_status=row["response_status"],
+                content_type=row["content_type"],
+                body_kind=BodyKind(row["body_kind"]),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_actor_outcomes(
+        self, operation_id: UUID
+    ) -> tuple[ActorOutcome, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT observations.actor_id, observations.provenance,
+                       observations.response_status,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN observations ON observations.id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY observations.actor_id, observations.provenance,
+                         observations.response_status
+                ORDER BY observations.actor_id, observations.provenance,
+                         observations.response_status
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            ActorOutcome(
+                actor_id=row["actor_id"],
+                provenance=ObservationProvenance(row["provenance"]),
+                response_status=row["response_status"],
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
 
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
         self._require_writable()

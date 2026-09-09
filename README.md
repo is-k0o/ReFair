@@ -14,7 +14,8 @@ state transitions.
 ## V0.1.5
 
 This repository provides the deterministic foundation, the first passive
-Burp/Montoya ingestion bridge, and the bounded V0.2-A normalization slice:
+Burp/Montoya ingestion bridge, V0.2-A normalization, and the minimal V0.2-B1
+structural application model:
 
 - typed Pydantic models for projects, actors, evidence, interpretations,
   experiments, policy outcomes, budgets, usage, and run state;
@@ -32,13 +33,15 @@ Burp/Montoya ingestion bridge, and the bounded V0.2-A normalization slice:
 - a read-only command-line inspector for safe summaries, recent observation
   metadata, and explicitly bounded raw previews;
 - a separate deterministic processor that projects immutable observations into
-  value-free URL, content-type, body-kind, size, and SHA-256 metadata.
+  value-free URL, content-type, body-kind, size, and SHA-256 metadata;
+- exact endpoints, exact-method operations, evidence links, and passive method
+  advertisements, with structural views computed from existing evidence.
 
 V0.1.5 does **not** generate active traffic, crawl, scan, exploit, automate a
-browser, call an LLM or Burp AI, use MCP/RAG/vector storage, aggregate or infer
-endpoints, provide a UI, or implement multi-agent behavior. It does not yet
-contain a complete scope or authorization policy engine. The public package
-version remains V0.1.5 while this internal V0.2-A slice is developed.
+browser, call an LLM or Burp AI, use MCP/RAG/vector storage, infer routes or
+resource templates, provide a UI, or implement multi-agent behavior. It does not
+yet contain a complete scope or authorization policy engine. The public package
+version remains V0.1.5 while these bounded internal V0.2 slices are developed.
 
 The bridge is passive and fail-open relative to browser traffic. Burp callbacks
 never wait for the collector. Events enter a bounded in-memory queue and receive
@@ -63,7 +66,7 @@ Firefox
   -> SQLite
 
 Separate operator command:
-  SQLite -> deterministic normalizer -> NormalizedExchange
+  SQLite -> deterministic normalizer -> NormalizedExchange -> B1 structure
 ```
 
 The Java envelope contains the listener port and raw messages, but no trusted
@@ -82,7 +85,7 @@ refair/
   assets/       content-based static asset identity
   bridge/       strict passive collector transport and CLI
   inspect/      read-only observation inspection CLI
-  process/      out-of-band deterministic normalization CLI
+  process/      out-of-band deterministic derived-state CLI
   models/       domain, budget, experiment, and run-state models
   policy/       deterministic budget and active-concurrency controls
   storage/      explicit SQLite schema and repository
@@ -152,26 +155,31 @@ refair-inspect --config config.example.yaml show <observation-uuid> --raw-previe
 This is bounded presentation, not redaction; immutable stored evidence is never
 changed.
 
-## Process normalized exchanges
+## Process derived state
 
-Normalization runs outside the passive collector and reads the same configured
-SQLite path:
+Normalization and B1 structural extraction run outside the passive collector
+and read the same configured SQLite path:
 
 ```powershell
 refair-process --config config.example.yaml
 ```
 
 The equivalent module form is `python -m refair.process`. The command migrates a
-legacy V0.1.5 database to schema version 1, then processes missing or stale
-normalized rows in bounded batches. Derived rows are reprocessed only for a
-newer normalizer version. The command prints processed, pending, and warning
-counts; an immediate second run reports zero newly processed observations.
+legacy database to schema version 2, then runs separate, bounded normalization
+and structural phases. Missing or stale derived rows are processed by their
+independent version. An immediate second run reports zero newly processed rows.
 
 Normalized rows contain URL components, ordered query parameter names, exact raw
 query/body hashes, normalized content types, body kinds, sizes, and parser
 warnings. They do not duplicate raw HTTP, header secrets, query values, form
 values, JSON values, or response contents. Raw `Observation` rows remain the
 immutable source of truth.
+
+B1 persists exact endpoints, exact observed methods, observation-to-operation
+links, and evidence-backed `Allow`/CORS method advertisements. Query shapes,
+request/response representations, and actor outcomes are read-only aggregates;
+they do not create duplicate summary tables. Advertised methods are not treated
+as verified operations. Route inference remains unimplemented.
 
 ## Manual smoke test
 

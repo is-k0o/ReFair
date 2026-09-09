@@ -49,7 +49,9 @@ def test_processor_uses_config_database_and_only_processes_pending(
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     observed_batch_sizes: list[int] = []
+    observed_structural_batch_sizes: list[int] = []
     original_list_pending = SQLiteRepository.list_pending_observations
+    original_list_structural = SQLiteRepository.list_pending_structural_inputs
 
     def tracked_list_pending(self, **kwargs):
         batch = original_list_pending(self, **kwargs)
@@ -58,23 +60,41 @@ def test_processor_uses_config_database_and_only_processes_pending(
         assert kwargs["target_normalizer_version"] == NORMALIZER_VERSION
         return batch
 
-    monkeypatch.setattr("refair.process.cli.PROCESS_BATCH_SIZE", 1)
+    def tracked_list_structural(self, **kwargs):
+        batch = original_list_structural(self, **kwargs)
+        observed_structural_batch_sizes.append(len(batch))
+        assert kwargs["limit"] == 1
+        return batch
+
+    monkeypatch.setattr("refair.process.cli.NORMALIZATION_BATCH_SIZE", 1)
+    monkeypatch.setattr("refair.process.cli.STRUCTURAL_BATCH_SIZE", 1)
     monkeypatch.setattr(
         SQLiteRepository, "list_pending_observations", tracked_list_pending
+    )
+    monkeypatch.setattr(
+        SQLiteRepository, "list_pending_structural_inputs", tracked_list_structural
     )
 
     assert main(["--config", str(config_path)]) == 0
     first_output = capsys.readouterr().out
-    assert "processed: 2" in first_output
-    assert "pending: 0" in first_output
+    assert "normalized_processed: 2" in first_output
+    assert "normalization_pending: 0" in first_output
+    assert "structural_processed: 2" in first_output
+    assert "structural_pending: 0" in first_output
     assert "warnings: 0" in first_output
     assert observed_batch_sizes == [1, 1, 0]
+    assert observed_structural_batch_sizes == [1, 1, 0]
 
     assert main(["--config", str(config_path)]) == 0
     second_output = capsys.readouterr().out
-    assert "processed: 0" in second_output
-    assert "pending: 0" in second_output
+    assert "normalized_processed: 0" in second_output
+    assert "normalization_pending: 0" in second_output
+    assert "structural_processed: 0" in second_output
+    assert "structural_pending: 0" in second_output
     assert repository.count_normalized_exchanges() == 2
+    assert repository.count_exact_endpoints() == 2
+    assert repository.count_http_operations() == 2
+    assert repository.count_operation_observations() == 2
     assert all(
         repository.get_normalized_exchange(item.id).normalizer_version
         == NORMALIZER_VERSION
