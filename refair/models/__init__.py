@@ -9,7 +9,6 @@ from refair.models.budget import (
     RunUsage,
 )
 from refair.models.evidence import (
-    Endpoint,
     Entity,
     EntityClaim,
     Hypothesis,
@@ -44,7 +43,6 @@ __all__ = [
     "ApiUsage",
     "ActorOutcome",
     "BodyKind",
-    "Endpoint",
     "Entity",
     "EntityClaim",
     "ExactEndpoint",

@@ -15,6 +15,8 @@ from refair.models.structure import (
     MethodAdvertisementSource,
 )
 
+# If normalization changes scheme/host/port/path, structural identity must be
+# invalidated with a STRUCTURAL_VERSION bump and a deliberate derived-state rebuild.
 STRUCTURAL_VERSION = 1
 
 _ENDPOINT_NAMESPACE = UUID("740d7447-12db-4c69-995d-9c42eb096218")

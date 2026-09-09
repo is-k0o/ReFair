@@ -35,19 +35,6 @@ class Observation(BaseModel):
     raw_response: bytes | None = None
 
 
-class Endpoint(BaseModel):
-    """An observed HTTP surface, optionally grouped by a route template."""
-
-    model_config = ConfigDict(frozen=True)
-
-    id: UUID = Field(default_factory=uuid4)
-    project_id: UUID
-    method: str = Field(min_length=1)
-    observed_url: str = Field(min_length=1)
-    route_template: str | None = None
-    evidence_ids: tuple[UUID, ...] = ()
-
-
 class EntityClaim(BaseModel):
     """A provenance-bearing assertion about an entity."""
 

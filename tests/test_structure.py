@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import UUID
 
+import refair.models as models
+
 from refair.models import (
     BodyKind,
     MethodAdvertisementSource,
@@ -14,6 +16,12 @@ from refair.storage import SQLiteRepository
 from refair.structure import STRUCTURAL_VERSION, extract_structure
 
 PROJECT_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+def test_public_models_expose_only_b1_endpoint_abstraction() -> None:
+    assert not hasattr(models, "Endpoint")
+    assert hasattr(models, "ExactEndpoint")
+    assert hasattr(models, "HttpOperation")
 
 
 def make_observation(
