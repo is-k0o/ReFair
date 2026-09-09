@@ -133,6 +133,74 @@ class OperationJsonField(BaseModel):
     duplicate_key_observed: bool = False
 
 
+class FormDirection(StrEnum):
+    REQUEST = "REQUEST"
+    RESPONSE = "RESPONSE"
+
+
+class FormParseStatus(StrEnum):
+    PARSED = "PARSED"
+    SKIPPED_TOO_LARGE = "SKIPPED_TOO_LARGE"
+    LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+    UNSUPPORTED_CONTENT_ENCODING = "UNSUPPORTED_CONTENT_ENCODING"
+    CONTENT_DECODING_FAILED = "CONTENT_DECODING_FAILED"
+
+
+class FormDocument(BaseModel):
+    """Value-free parse result for one URL-encoded request or response body."""
+
+    model_config = ConfigDict(frozen=True)
+
+    observation_id: UUID
+    direction: FormDirection
+    parse_status: FormParseStatus
+
+
+class FormFieldObservation(BaseModel):
+    """Occurrences of one decoded byte-level form field name."""
+
+    model_config = ConfigDict(frozen=True)
+
+    observation_id: UUID
+    direction: FormDirection
+    field_name: bytes
+    occurrence_count: int = Field(ge=1)
+    assigned_occurrence_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def assigned_occurrences_do_not_exceed_total(self) -> Self:
+        if self.assigned_occurrence_count > self.occurrence_count:
+            raise ValueError("assigned occurrences cannot exceed total occurrences")
+        return self
+
+
+class OperationFormDocumentOutcome(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    direction: FormDirection
+    parse_status: FormParseStatus
+    observation_count: int = Field(ge=1)
+
+
+class OperationFormField(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    direction: FormDirection
+    field_name: bytes
+    observation_count: int = Field(ge=1)
+    total_occurrence_count: int = Field(ge=1)
+    total_assigned_occurrence_count: int = Field(ge=0)
+    max_occurrence_count: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def aggregate_counts_are_consistent(self) -> Self:
+        if self.total_assigned_occurrence_count > self.total_occurrence_count:
+            raise ValueError("assigned occurrences cannot exceed total occurrences")
+        if self.max_occurrence_count > self.total_occurrence_count:
+            raise ValueError("maximum occurrences cannot exceed total occurrences")
+        return self
+
+
 class OperationQueryShape(BaseModel):
     model_config = ConfigDict(frozen=True)
 

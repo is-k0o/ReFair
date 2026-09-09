@@ -17,6 +17,8 @@ from refair.models.normalized import BodyKind, NormalizedExchange
 from refair.models.structure import (
     ActorOutcome,
     ExactEndpoint,
+    FormDirection,
+    FormParseStatus,
     HttpOperation,
     JsonArrayItem,
     JsonDirection,
@@ -25,6 +27,8 @@ from refair.models.structure import (
     JsonType,
     MethodAdvertisement,
     MethodAdvertisementSource,
+    OperationFormDocumentOutcome,
+    OperationFormField,
     OperationJsonDocumentOutcome,
     OperationJsonField,
     OperationQueryShape,
@@ -33,7 +37,7 @@ from refair.models.structure import (
 )
 from refair.structure import StructuralExtraction
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -281,6 +285,33 @@ DROP TABLE json_documents_schema_3;
 
 CREATE INDEX json_field_observations_operation_join_idx
 ON json_field_observations(observation_id, direction);
+""",
+    5: """
+CREATE TABLE form_documents (
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    direction TEXT NOT NULL CHECK(direction IN ('REQUEST', 'RESPONSE')),
+    parse_status TEXT NOT NULL CHECK(
+        parse_status IN (
+            'PARSED', 'SKIPPED_TOO_LARGE', 'LIMIT_EXCEEDED',
+            'UNSUPPORTED_CONTENT_ENCODING', 'CONTENT_DECODING_FAILED'
+        )
+    ),
+    PRIMARY KEY (observation_id, direction)
+);
+
+CREATE TABLE form_field_observations (
+    observation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    field_name BLOB NOT NULL CHECK(typeof(field_name) = 'blob'),
+    occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 1),
+    assigned_occurrence_count INTEGER NOT NULL CHECK(
+        assigned_occurrence_count >= 0 AND
+        assigned_occurrence_count <= occurrence_count
+    ),
+    PRIMARY KEY (observation_id, direction, field_name),
+    FOREIGN KEY (observation_id, direction)
+        REFERENCES form_documents(observation_id, direction) ON DELETE CASCADE
+);
 """,
 }
 
@@ -734,6 +765,21 @@ class SQLiteRepository:
             for field in extraction.json_fields
         ):
             raise ValueError("JSON field does not belong to extraction document")
+        form_document_keys = {
+            (document.observation_id, document.direction)
+            for document in extraction.form_documents
+        }
+        if any(
+            document.observation_id != extraction.observation_id
+            for document in extraction.form_documents
+        ):
+            raise ValueError("FORM document does not belong to extraction")
+        if any(
+            field.observation_id != extraction.observation_id
+            or (field.observation_id, field.direction) not in form_document_keys
+            for field in extraction.form_fields
+        ):
+            raise ValueError("FORM field does not belong to extraction document")
 
         with self._connection() as connection:
             existing = connection.execute(
@@ -847,6 +893,47 @@ class SQLiteRepository:
                 ],
             )
             connection.execute(
+                "DELETE FROM form_field_observations WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.execute(
+                "DELETE FROM form_documents WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.executemany(
+                """
+                INSERT INTO form_documents (
+                    observation_id, direction, parse_status
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        item.parse_status.value,
+                    )
+                    for item in extraction.form_documents
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO form_field_observations (
+                    observation_id, direction, field_name, occurrence_count,
+                    assigned_occurrence_count
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        item.field_name,
+                        item.occurrence_count,
+                        item.assigned_occurrence_count,
+                    )
+                    for item in extraction.form_fields
+                ],
+            )
+            connection.execute(
                 """
                 INSERT INTO structural_processing (
                     observation_id, structural_version
@@ -936,6 +1023,12 @@ class SQLiteRepository:
     def count_json_field_observations(self) -> int:
         return self._table_count("json_field_observations")
 
+    def count_form_documents(self) -> int:
+        return self._table_count("form_documents")
+
+    def count_form_field_observations(self) -> int:
+        return self._table_count("form_field_observations")
+
     def _table_count(self, table: str) -> int:
         allowed = {
             "exact_endpoints",
@@ -944,6 +1037,8 @@ class SQLiteRepository:
             "method_advertisements",
             "json_documents",
             "json_field_observations",
+            "form_documents",
+            "form_field_observations",
         }
         if table not in allowed:
             raise ValueError("unsupported structural table")
@@ -1140,6 +1235,73 @@ class SQLiteRepository:
                 json_type=JsonType(row["json_type"]),
                 observation_count=int(row["observation_count"]),
                 duplicate_key_observed=bool(row["duplicate_key_observed"]),
+            )
+            for row in rows
+        )
+
+    def operation_form_document_outcomes(
+        self, operation_id: UUID
+    ) -> tuple[OperationFormDocumentOutcome, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT form_documents.direction, form_documents.parse_status,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN form_documents ON form_documents.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY form_documents.direction, form_documents.parse_status
+                ORDER BY form_documents.direction, form_documents.parse_status
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationFormDocumentOutcome(
+                direction=FormDirection(row["direction"]),
+                parse_status=FormParseStatus(row["parse_status"]),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_form_fields(
+        self, operation_id: UUID
+    ) -> tuple[OperationFormField, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT form_field_observations.direction,
+                       form_field_observations.field_name,
+                       COUNT(*) AS observation_count,
+                       SUM(form_field_observations.occurrence_count)
+                           AS total_occurrence_count,
+                       SUM(form_field_observations.assigned_occurrence_count)
+                           AS total_assigned_occurrence_count,
+                       MAX(form_field_observations.occurrence_count)
+                           AS max_occurrence_count
+                FROM operation_observations
+                JOIN form_field_observations ON
+                    form_field_observations.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY form_field_observations.direction,
+                         form_field_observations.field_name
+                ORDER BY form_field_observations.direction,
+                         form_field_observations.field_name
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationFormField(
+                direction=FormDirection(row["direction"]),
+                field_name=bytes(row["field_name"]),
+                observation_count=int(row["observation_count"]),
+                total_occurrence_count=int(row["total_occurrence_count"]),
+                total_assigned_occurrence_count=int(
+                    row["total_assigned_occurrence_count"]
+                ),
+                max_occurrence_count=int(row["max_occurrence_count"]),
             )
             for row in rows
         )

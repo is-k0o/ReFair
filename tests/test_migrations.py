@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import gzip
+import json
 import sqlite3
-from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
 
 from refair.models import (
+    FormParseStatus,
     JsonParseStatus,
     JsonType,
     Observation,
@@ -88,7 +89,7 @@ def test_legacy_database_migrates_without_changing_raw_observation(tmp_path) -> 
     assert after == before
     assert bytes(after[8]) == observation.raw_request
     assert bytes(after[9]) == observation.raw_response
-    assert version == CURRENT_SCHEMA_VERSION == 4
+    assert version == CURRENT_SCHEMA_VERSION == 5
     assert normalized_table == ("normalized_exchanges",)
     assert "raw_request" not in normalized_columns
     assert "raw_response" not in normalized_columns
@@ -132,7 +133,7 @@ def test_schema_one_migration_preserves_raw_and_normalized_rows(tmp_path) -> Non
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             connection.execute("SELECT * FROM observations").fetchall()
             == raw_before
@@ -282,7 +283,7 @@ def test_schema_two_migrates_and_reprocesses_json_without_changing_b1_or_evidenc
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         for table, rows in preserved.items():
             assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
         assert bytes(preserved["observations"][0][8]) == observation.raw_request
@@ -325,16 +326,17 @@ def test_schema_two_migrates_and_reprocesses_json_without_changing_b1_or_evidenc
         ).fetchone() == (STRUCTURAL_VERSION,)
 
 
-def test_schema_three_preserves_b2a_rows_then_reprocesses_for_content_encoding(
+def test_schema_four_preserves_b2a_rows_then_reprocesses_for_form_extraction(
     tmp_path,
 ) -> None:
-    database = tmp_path / "schema-three.sqlite3"
+    database = tmp_path / "schema-four.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.executescript(LEGACY_SCHEMA)
         connection.executescript(MIGRATIONS[1])
         connection.executescript(MIGRATIONS[2])
         connection.executescript(MIGRATIONS[3])
-        connection.execute("PRAGMA user_version = 3")
+        connection.executescript(MIGRATIONS[4])
+        connection.execute("PRAGMA user_version = 4")
 
     repository = SQLiteRepository(database)
     observation = repository.add_observation(
@@ -345,25 +347,89 @@ def test_schema_three_preserves_b2a_rows_then_reprocesses_for_content_encoding(
             provenance=ObservationProvenance.BROWSER,
             actor_id="actor_gzip",
             method="POST",
-            url="https://example.test/gzip",
+            url="https://example.test/form",
             response_status=200,
             raw_request=(
-                b"POST /gzip HTTP/1.1\r\nContent-Type: application/json\r\n"
+                b"POST /form HTTP/1.1\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\n"
                 b"Content-Encoding: gzip\r\n\r\n"
-                + gzip.compress(b'{"id":"raw-secret"}', mtime=0)
+                + gzip.compress(b"id=form-secret", mtime=0)
             ),
-            raw_response=b"HTTP/1.1 200 OK\r\n\r\n",
+            raw_response=(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                b'{"id":"raw-secret"}'
+            ),
         )
     )
     normalized = repository.add_normalized_exchange(
         normalize_observation(observation)
     )
     extraction = extract_structure(observation, normalized)
-    old_extraction = replace(
-        extraction,
-        structural_version=2,
-    )
-    assert repository.add_structural_extraction(old_extraction)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO exact_endpoints VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(extraction.endpoint.id),
+                str(extraction.endpoint.project_id),
+                extraction.endpoint.scheme,
+                extraction.endpoint.host,
+                extraction.endpoint.port,
+                extraction.endpoint.path,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO http_operations VALUES (?, ?, ?)",
+            (
+                str(extraction.operation.id),
+                str(extraction.operation.endpoint_id),
+                extraction.operation.method,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO operation_observations VALUES (?, ?)",
+            (str(observation.id), str(extraction.operation.id)),
+        )
+        connection.executemany(
+            "INSERT INTO method_advertisements VALUES (?, ?, ?, ?)",
+            [
+                (
+                    str(item.endpoint_id),
+                    item.source.value,
+                    item.advertised_method,
+                    str(item.observation_id),
+                )
+                for item in extraction.advertisements
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO json_documents VALUES (?, ?, ?, ?)",
+            [
+                (
+                    str(item.observation_id),
+                    item.direction.value,
+                    item.parse_status.value,
+                    item.root_type.value if item.root_type is not None else None,
+                )
+                for item in extraction.json_documents
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO json_field_observations VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    str(item.observation_id),
+                    item.direction.value,
+                    json.dumps(item.path, separators=(",", ":")),
+                    item.json_type.value,
+                    int(item.duplicate_key_observed),
+                )
+                for item in extraction.json_fields
+            ],
+        )
+        connection.execute(
+            "INSERT INTO structural_processing VALUES (?, 3)",
+            (str(observation.id),),
+        )
 
     preserved_tables = (
         "observations",
@@ -385,7 +451,7 @@ def test_schema_three_preserves_b2a_rows_then_reprocesses_for_content_encoding(
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         for table, rows in preserved.items():
             assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
         assert bytes(preserved["observations"][0][8]) == observation.raw_request
@@ -412,6 +478,13 @@ def test_schema_three_preserves_b2a_rows_then_reprocesses_for_content_encoding(
         (JsonParseStatus.PARSED, JsonType.OBJECT)
     ]
     assert repository.count_json_field_observations() == 1
+    form_outcomes = repository.operation_form_document_outcomes(
+        extraction.operation.id
+    )
+    assert [item.parse_status for item in form_outcomes] == [
+        FormParseStatus.PARSED
+    ]
+    assert repository.count_form_field_observations() == 1
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT structural_version FROM structural_processing"
