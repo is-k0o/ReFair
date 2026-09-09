@@ -27,17 +27,22 @@ from refair.models.structure import (
     JsonType,
     MethodAdvertisement,
     MethodAdvertisementSource,
+    MultipartDirection,
+    MultipartParseStatus,
+    MultipartPartName,
+    MultipartPartObservation,
     OperationFormDocumentOutcome,
     OperationFormField,
     OperationJsonDocumentOutcome,
     OperationJsonField,
+    OperationMultipartDocumentOutcome,
     OperationQueryShape,
     RequestRepresentation,
     ResponseRepresentation,
 )
 from refair.structure import StructuralExtraction
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -311,6 +316,47 @@ CREATE TABLE form_field_observations (
     PRIMARY KEY (observation_id, direction, field_name),
     FOREIGN KEY (observation_id, direction)
         REFERENCES form_documents(observation_id, direction) ON DELETE CASCADE
+);
+""",
+    6: """
+CREATE TABLE multipart_documents (
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    direction TEXT NOT NULL CHECK(direction IN ('REQUEST', 'RESPONSE')),
+    parse_status TEXT NOT NULL CHECK(
+        parse_status IN (
+            'PARSED', 'MALFORMED', 'SKIPPED_TOO_LARGE', 'LIMIT_EXCEEDED',
+            'UNSUPPORTED_CONTENT_ENCODING', 'CONTENT_DECODING_FAILED'
+        )
+    ),
+    PRIMARY KEY (observation_id, direction)
+);
+
+CREATE TABLE multipart_parts (
+    observation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    part_index INTEGER NOT NULL CHECK(part_index >= 0),
+    disposition_type TEXT,
+    content_type TEXT,
+    name_parameter_count INTEGER NOT NULL CHECK(name_parameter_count >= 0),
+    filename_parameter_count INTEGER NOT NULL CHECK(filename_parameter_count >= 0),
+    filename_empty_count INTEGER NOT NULL CHECK(filename_empty_count >= 0),
+    filename_nonempty_count INTEGER NOT NULL CHECK(filename_nonempty_count >= 0),
+    CHECK(filename_parameter_count = filename_empty_count + filename_nonempty_count),
+    PRIMARY KEY (observation_id, direction, part_index),
+    FOREIGN KEY (observation_id, direction)
+        REFERENCES multipart_documents(observation_id, direction) ON DELETE CASCADE
+);
+
+CREATE TABLE multipart_part_names (
+    observation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    part_index INTEGER NOT NULL,
+    name BLOB NOT NULL CHECK(typeof(name) = 'blob'),
+    occurrence_count INTEGER NOT NULL CHECK(occurrence_count >= 1),
+    PRIMARY KEY (observation_id, direction, part_index, name),
+    FOREIGN KEY (observation_id, direction, part_index)
+        REFERENCES multipart_parts(observation_id, direction, part_index)
+        ON DELETE CASCADE
 );
 """,
 }
@@ -780,6 +826,27 @@ class SQLiteRepository:
             for field in extraction.form_fields
         ):
             raise ValueError("FORM field does not belong to extraction document")
+        multipart_document_keys = {
+            (document.observation_id, document.direction)
+            for document in extraction.multipart_documents
+        }
+        if any(
+            document.observation_id != extraction.observation_id
+            for document in extraction.multipart_documents
+        ):
+            raise ValueError("multipart document does not belong to extraction")
+        multipart_part_keys = [
+            (part.observation_id, part.direction, part.part_index)
+            for part in extraction.multipart_parts
+        ]
+        if len(multipart_part_keys) != len(set(multipart_part_keys)):
+            raise ValueError("duplicate multipart part occurrence")
+        if any(
+            part.observation_id != extraction.observation_id
+            or (part.observation_id, part.direction) not in multipart_document_keys
+            for part in extraction.multipart_parts
+        ):
+            raise ValueError("multipart part does not belong to extraction document")
 
         with self._connection() as connection:
             existing = connection.execute(
@@ -934,6 +1001,76 @@ class SQLiteRepository:
                 ],
             )
             connection.execute(
+                "DELETE FROM multipart_part_names WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.execute(
+                "DELETE FROM multipart_parts WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.execute(
+                "DELETE FROM multipart_documents WHERE observation_id = ?",
+                (str(extraction.observation_id),),
+            )
+            connection.executemany(
+                """
+                INSERT INTO multipart_documents (
+                    observation_id, direction, parse_status
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        item.parse_status.value,
+                    )
+                    for item in extraction.multipart_documents
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO multipart_parts (
+                    observation_id, direction, part_index, disposition_type,
+                    content_type, name_parameter_count,
+                    filename_parameter_count, filename_empty_count,
+                    filename_nonempty_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(item.observation_id),
+                        item.direction.value,
+                        item.part_index,
+                        item.disposition_type,
+                        item.content_type,
+                        item.name_parameter_count,
+                        item.filename_parameter_count,
+                        item.filename_empty_count,
+                        item.filename_nonempty_count,
+                    )
+                    for item in extraction.multipart_parts
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO multipart_part_names (
+                    observation_id, direction, part_index, name,
+                    occurrence_count
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(part.observation_id),
+                        part.direction.value,
+                        part.part_index,
+                        name.name,
+                        name.occurrence_count,
+                    )
+                    for part in extraction.multipart_parts
+                    for name in part.names
+                ],
+            )
+            connection.execute(
                 """
                 INSERT INTO structural_processing (
                     observation_id, structural_version
@@ -1029,6 +1166,15 @@ class SQLiteRepository:
     def count_form_field_observations(self) -> int:
         return self._table_count("form_field_observations")
 
+    def count_multipart_documents(self) -> int:
+        return self._table_count("multipart_documents")
+
+    def count_multipart_parts(self) -> int:
+        return self._table_count("multipart_parts")
+
+    def count_multipart_part_names(self) -> int:
+        return self._table_count("multipart_part_names")
+
     def _table_count(self, table: str) -> int:
         allowed = {
             "exact_endpoints",
@@ -1039,6 +1185,9 @@ class SQLiteRepository:
             "json_field_observations",
             "form_documents",
             "form_field_observations",
+            "multipart_documents",
+            "multipart_parts",
+            "multipart_part_names",
         }
         if table not in allowed:
             raise ValueError("unsupported structural table")
@@ -1304,6 +1453,96 @@ class SQLiteRepository:
                 max_occurrence_count=int(row["max_occurrence_count"]),
             )
             for row in rows
+        )
+
+    def operation_multipart_document_outcomes(
+        self, operation_id: UUID
+    ) -> tuple[OperationMultipartDocumentOutcome, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT multipart_documents.direction,
+                       multipart_documents.parse_status,
+                       COUNT(*) AS observation_count
+                FROM operation_observations
+                JOIN multipart_documents ON multipart_documents.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                GROUP BY multipart_documents.direction,
+                         multipart_documents.parse_status
+                ORDER BY multipart_documents.direction,
+                         multipart_documents.parse_status
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationMultipartDocumentOutcome(
+                direction=MultipartDirection(row["direction"]),
+                parse_status=MultipartParseStatus(row["parse_status"]),
+                observation_count=int(row["observation_count"]),
+            )
+            for row in rows
+        )
+
+    def operation_multipart_parts(
+        self, operation_id: UUID
+    ) -> tuple[MultipartPartObservation, ...]:
+        with self._connection() as connection:
+            part_rows = connection.execute(
+                """
+                SELECT multipart_parts.*
+                FROM operation_observations
+                JOIN multipart_parts ON multipart_parts.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                ORDER BY multipart_parts.observation_id,
+                         multipart_parts.direction,
+                         multipart_parts.part_index
+                """,
+                (str(operation_id),),
+            ).fetchall()
+            name_rows = connection.execute(
+                """
+                SELECT multipart_part_names.*
+                FROM operation_observations
+                JOIN multipart_part_names ON multipart_part_names.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                ORDER BY multipart_part_names.observation_id,
+                         multipart_part_names.direction,
+                         multipart_part_names.part_index,
+                         multipart_part_names.name
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        names: dict[tuple[str, str, int], list[MultipartPartName]] = {}
+        for row in name_rows:
+            key = (row["observation_id"], row["direction"], row["part_index"])
+            names.setdefault(key, []).append(
+                MultipartPartName(
+                    name=bytes(row["name"]),
+                    occurrence_count=int(row["occurrence_count"]),
+                )
+            )
+        return tuple(
+            MultipartPartObservation(
+                observation_id=UUID(row["observation_id"]),
+                direction=MultipartDirection(row["direction"]),
+                part_index=int(row["part_index"]),
+                disposition_type=row["disposition_type"],
+                content_type=row["content_type"],
+                name_parameter_count=int(row["name_parameter_count"]),
+                filename_parameter_count=int(row["filename_parameter_count"]),
+                filename_empty_count=int(row["filename_empty_count"]),
+                filename_nonempty_count=int(row["filename_nonempty_count"]),
+                names=tuple(
+                    names.get(
+                        (row["observation_id"], row["direction"], row["part_index"]),
+                        (),
+                    )
+                ),
+            )
+            for row in part_rows
         )
 
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:

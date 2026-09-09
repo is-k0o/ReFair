@@ -28,12 +28,17 @@ from refair.models.structure import (
     JsonType,
     MethodAdvertisement,
     MethodAdvertisementSource,
+    MultipartDirection,
+    MultipartDocument,
+    MultipartParseStatus,
+    MultipartPartName,
+    MultipartPartObservation,
 )
 from refair.normalization import _split_headers_and_body
 
 # If normalization changes scheme/host/port/path, structural identity must be
 # invalidated with a STRUCTURAL_VERSION bump and a deliberate derived-state rebuild.
-STRUCTURAL_VERSION = 4
+STRUCTURAL_VERSION = 5
 
 MAX_JSON_BODY_BYTES = 1_048_576
 MAX_JSON_DECODED_BYTES = 1_048_576
@@ -43,6 +48,14 @@ MAX_FORM_BODY_BYTES = 1_048_576
 MAX_FORM_DECODED_BYTES = 1_048_576
 MAX_FORM_FIELDS = 10_000
 MAX_FORM_FIELD_NAME_BYTES = 16_384
+MAX_MULTIPART_BODY_BYTES = 1_048_576
+MAX_MULTIPART_DECODED_BYTES = 1_048_576
+MAX_MULTIPART_PARTS = 1_000
+MAX_MULTIPART_BOUNDARY_BYTES = 1_024
+MAX_MULTIPART_TOP_HEADER_BYTES = 65_536
+MAX_MULTIPART_PART_HEADER_BYTES = 65_536
+MAX_MULTIPART_NAME_BYTES = 16_384
+MAX_MULTIPART_DISPOSITION_PARAMETERS = 256
 
 _ENDPOINT_NAMESPACE = UUID("740d7447-12db-4c69-995d-9c42eb096218")
 _OPERATION_NAMESPACE = UUID("cfc8b926-e55d-4092-98f4-30150610355d")
@@ -63,6 +76,8 @@ class StructuralExtraction:
     json_fields: tuple[JsonFieldObservation, ...]
     form_documents: tuple[FormDocument, ...]
     form_fields: tuple[FormFieldObservation, ...]
+    multipart_documents: tuple[MultipartDocument, ...]
+    multipart_parts: tuple[MultipartPartObservation, ...]
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,14 @@ class _JsonLimitExceeded(Exception):
 
 
 class _FormLimitExceeded(Exception):
+    pass
+
+
+class _MultipartMalformed(Exception):
+    pass
+
+
+class _MultipartLimitExceeded(Exception):
     pass
 
 
@@ -248,18 +271,25 @@ def _decode_representation(
     role: str,
     max_body_bytes: int,
     max_decoded_bytes: int,
-) -> tuple[bytes | None, _RepresentationDecodeStatus | None]:
+) -> tuple[bytes, bytes | None, _RepresentationDecodeStatus | None]:
     headers, body = _split_headers_and_body(raw_message, role, [])
     if len(body) > max_body_bytes:
-        return None, _RepresentationDecodeStatus.SKIPPED_TOO_LARGE
+        return headers, None, _RepresentationDecodeStatus.SKIPPED_TOO_LARGE
     encoding = _content_encoding(headers)
     if encoding is None:
-        return None, _RepresentationDecodeStatus.UNSUPPORTED_CONTENT_ENCODING
+        return (
+            headers,
+            None,
+            _RepresentationDecodeStatus.UNSUPPORTED_CONTENT_ENCODING,
+        )
     if encoding == "gzip":
-        return _decode_gzip(body, max_decoded_bytes=max_decoded_bytes)
+        decoded, status = _decode_gzip(
+            body, max_decoded_bytes=max_decoded_bytes
+        )
+        return headers, decoded, status
     if len(body) > max_decoded_bytes:
-        return None, _RepresentationDecodeStatus.SKIPPED_TOO_LARGE
-    return body, None
+        return headers, None, _RepresentationDecodeStatus.SKIPPED_TOO_LARGE
+    return headers, body, None
 
 
 def _extract_json_document(
@@ -267,7 +297,7 @@ def _extract_json_document(
     direction: JsonDirection,
     raw_message: bytes,
 ) -> tuple[JsonDocument, tuple[JsonFieldObservation, ...]]:
-    body, decode_status = _decode_representation(
+    _, body, decode_status = _decode_representation(
         raw_message,
         role=direction.value.lower(),
         max_body_bytes=MAX_JSON_BODY_BYTES,
@@ -376,7 +406,7 @@ def _extract_form_document(
     direction: FormDirection,
     raw_message: bytes,
 ) -> tuple[FormDocument, tuple[FormFieldObservation, ...]]:
-    body, decode_status = _decode_representation(
+    _, body, decode_status = _decode_representation(
         raw_message,
         role=direction.value.lower(),
         max_body_bytes=MAX_FORM_BODY_BYTES,
@@ -477,6 +507,359 @@ def _form_structure(
     return tuple(documents), tuple(fields)
 
 
+_TOKEN_FORBIDDEN = frozenset(b'()<>@,;:\\"/[]?={} \t')
+
+
+def _is_ascii_token(value: bytes) -> bool:
+    return bool(value) and all(
+        33 <= byte <= 126 and byte not in _TOKEN_FORBIDDEN for byte in value
+    )
+
+
+def _semicolon_components(value: bytes) -> tuple[bytes, ...]:
+    components: list[bytes] = []
+    start = 0
+    quoted = False
+    escaped = False
+    for index, byte in enumerate(value):
+        if byte in {ord("\r"), ord("\n")}:
+            raise _MultipartMalformed
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                quoted = False
+        elif byte == ord('"'):
+            quoted = True
+        elif byte == ord(";"):
+            components.append(value[start:index])
+            start = index + 1
+    if quoted or escaped:
+        raise _MultipartMalformed
+    components.append(value[start:])
+    return tuple(components)
+
+
+def _parameter_value(value: bytes) -> tuple[bytes, bool]:
+    value = value.strip(b" \t")
+    if not value.startswith(b'"'):
+        if not _is_ascii_token(value):
+            raise _MultipartMalformed
+        return value, False
+
+    decoded = bytearray()
+    escaped = False
+    closing_index: int | None = None
+    for index in range(1, len(value)):
+        byte = value[index]
+        if escaped:
+            decoded.append(byte)
+            escaped = False
+        elif byte == ord("\\"):
+            escaped = True
+        elif byte == ord('"'):
+            closing_index = index
+            break
+        else:
+            decoded.append(byte)
+    if escaped or closing_index is None:
+        raise _MultipartMalformed
+    if value[closing_index + 1 :].strip(b" \t"):
+        raise _MultipartMalformed
+    return bytes(decoded), True
+
+
+def _parameterized_header_value(
+    value: bytes, *, max_parameters: int
+) -> tuple[bytes, tuple[tuple[bytes, bytes, bool], ...]]:
+    components = _semicolon_components(value)
+    token = components[0].strip(b" \t").lower()
+    parameter_components = components[1:]
+    if len(parameter_components) > max_parameters:
+        raise _MultipartLimitExceeded
+    parameters: list[tuple[bytes, bytes, bool]] = []
+    for component in parameter_components:
+        name, separator, raw_value = component.partition(b"=")
+        name = name.strip(b" \t").lower()
+        if not separator or not _is_ascii_token(name):
+            raise _MultipartMalformed
+        decoded, quoted = _parameter_value(raw_value)
+        parameters.append((name, decoded, quoted))
+    return token, tuple(parameters)
+
+
+def _media_type(value: bytes) -> str:
+    type_name, separator, subtype = value.partition(b"/")
+    if not separator or not _is_ascii_token(type_name) or not _is_ascii_token(subtype):
+        raise _MultipartMalformed
+    try:
+        return f"{type_name.decode('ascii').lower()}/{subtype.decode('ascii').lower()}"
+    except UnicodeDecodeError as error:
+        raise _MultipartMalformed from error
+
+
+def _top_content_type(headers: bytes) -> bytes:
+    if len(headers) > MAX_MULTIPART_TOP_HEADER_BYTES:
+        raise _MultipartLimitExceeded
+    if b"\r" in headers.replace(b"\r\n", b""):
+        raise _MultipartMalformed
+    values: list[bytes] = []
+    for line in headers.replace(b"\r\n", b"\n").split(b"\n")[1:]:
+        name, separator, value = line.partition(b":")
+        if separator and name.strip().lower() == b"content-type":
+            values.append(value)
+    if len(values) != 1:
+        raise _MultipartMalformed
+    token, parameters = _parameterized_header_value(
+        values[0], max_parameters=MAX_MULTIPART_DISPOSITION_PARAMETERS
+    )
+    if _media_type(token) != "multipart/form-data":
+        raise _MultipartMalformed
+    boundaries = [
+        (value, quoted)
+        for name, value, quoted in parameters
+        if name == b"boundary"
+    ]
+    if len(boundaries) != 1:
+        raise _MultipartMalformed
+    boundary, quoted = boundaries[0]
+    if len(boundary) > MAX_MULTIPART_BOUNDARY_BYTES:
+        raise _MultipartLimitExceeded
+    if not boundary or b"\r" in boundary or b"\n" in boundary:
+        raise _MultipartMalformed
+    if not quoted and not _is_ascii_token(boundary):
+        raise _MultipartMalformed
+    return boundary
+
+
+def _multipart_part_blobs(body: bytes, boundary: bytes) -> tuple[bytes, ...]:
+    marker = b"--" + boundary
+    parts: list[bytes] = []
+    active = False
+    part_start = 0
+    line_start = 0
+    while line_start <= len(body):
+        newline = body.find(b"\n", line_start)
+        if newline < 0:
+            line = body[line_start:]
+            next_line = len(body) + 1
+        else:
+            line = body[line_start:newline]
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            next_line = newline + 1
+        if line in {marker, marker + b"--"}:
+            closing = line == marker + b"--"
+            if not active:
+                if closing:
+                    return ()
+                active = True
+            else:
+                parts.append(body[part_start:line_start])
+                if len(parts) > MAX_MULTIPART_PARTS:
+                    raise _MultipartLimitExceeded
+                if closing:
+                    return tuple(parts)
+            part_start = next_line
+        if newline < 0:
+            break
+        line_start = next_line
+    raise _MultipartMalformed
+
+
+def _part_header_block(part: bytes) -> bytes:
+    if part.startswith(b"\r\n"):
+        return b""
+    if part.startswith(b"\n"):
+        return b""
+    separators = tuple(
+        (position, separator)
+        for separator in (b"\r\n\r\n", b"\n\n")
+        if (position := part.find(separator)) >= 0
+    )
+    if not separators:
+        if len(part) > MAX_MULTIPART_PART_HEADER_BYTES:
+            raise _MultipartLimitExceeded
+        raise _MultipartMalformed
+    position, _ = min(separators, key=lambda item: item[0])
+    if position > MAX_MULTIPART_PART_HEADER_BYTES:
+        raise _MultipartLimitExceeded
+    return part[:position]
+
+
+def _selected_part_headers(headers: bytes) -> dict[bytes, list[bytes]]:
+    if len(headers) > MAX_MULTIPART_PART_HEADER_BYTES:
+        raise _MultipartLimitExceeded
+    if b"\r" in headers.replace(b"\r\n", b""):
+        raise _MultipartMalformed
+    selected = {b"content-disposition": [], b"content-type": []}
+    for line in headers.replace(b"\r\n", b"\n").split(b"\n"):
+        if not line:
+            continue
+        if line.startswith((b" ", b"\t")):
+            raise _MultipartMalformed
+        name, separator, value = line.partition(b":")
+        normalized_name = name.strip().lower()
+        if not separator or not _is_ascii_token(normalized_name):
+            raise _MultipartMalformed
+        if normalized_name in selected:
+            selected[normalized_name].append(value)
+    return selected
+
+
+def _multipart_part(
+    observation_id: UUID,
+    direction: MultipartDirection,
+    part_index: int,
+    part: bytes,
+) -> MultipartPartObservation:
+    selected = _selected_part_headers(_part_header_block(part))
+    disposition_values = selected[b"content-disposition"]
+    content_type_values = selected[b"content-type"]
+    if len(disposition_values) > 1 or len(content_type_values) > 1:
+        raise _MultipartMalformed
+
+    disposition_type: str | None = None
+    name_parameter_count = 0
+    names: dict[bytes, int] = {}
+    filename_parameter_count = 0
+    filename_empty_count = 0
+    filename_nonempty_count = 0
+    if disposition_values:
+        token, parameters = _parameterized_header_value(
+            disposition_values[0],
+            max_parameters=MAX_MULTIPART_DISPOSITION_PARAMETERS,
+        )
+        if not _is_ascii_token(token):
+            raise _MultipartMalformed
+        try:
+            disposition_type = token.decode("ascii").lower()
+        except UnicodeDecodeError as error:
+            raise _MultipartMalformed from error
+        for name, value, _ in parameters:
+            if name == b"name":
+                name_parameter_count += 1
+                if len(value) > MAX_MULTIPART_NAME_BYTES:
+                    raise _MultipartLimitExceeded
+                names[value] = names.get(value, 0) + 1
+            elif name == b"filename":
+                filename_parameter_count += 1
+                if value:
+                    filename_nonempty_count += 1
+                else:
+                    filename_empty_count += 1
+
+    content_type: str | None = None
+    if content_type_values:
+        token, _ = _parameterized_header_value(
+            content_type_values[0],
+            max_parameters=MAX_MULTIPART_DISPOSITION_PARAMETERS,
+        )
+        content_type = _media_type(token)
+
+    return MultipartPartObservation(
+        observation_id=observation_id,
+        direction=direction,
+        part_index=part_index,
+        disposition_type=disposition_type,
+        content_type=content_type,
+        name_parameter_count=name_parameter_count,
+        filename_parameter_count=filename_parameter_count,
+        filename_empty_count=filename_empty_count,
+        filename_nonempty_count=filename_nonempty_count,
+        names=tuple(
+            MultipartPartName(name=name, occurrence_count=count)
+            for name, count in sorted(names.items())
+        ),
+    )
+
+
+def _extract_multipart_document(
+    observation_id: UUID,
+    direction: MultipartDirection,
+    raw_message: bytes,
+) -> tuple[MultipartDocument, tuple[MultipartPartObservation, ...]]:
+    headers, body, decode_status = _decode_representation(
+        raw_message,
+        role=direction.value.lower(),
+        max_body_bytes=MAX_MULTIPART_BODY_BYTES,
+        max_decoded_bytes=MAX_MULTIPART_DECODED_BYTES,
+    )
+    if decode_status is not None:
+        return (
+            MultipartDocument(
+                observation_id=observation_id,
+                direction=direction,
+                parse_status=MultipartParseStatus(decode_status.value),
+            ),
+            (),
+        )
+    assert body is not None
+    try:
+        boundary = _top_content_type(headers)
+        parts = tuple(
+            _multipart_part(observation_id, direction, index, part)
+            for index, part in enumerate(_multipart_part_blobs(body, boundary))
+        )
+    except _MultipartLimitExceeded:
+        status = MultipartParseStatus.LIMIT_EXCEEDED
+    except _MultipartMalformed:
+        status = MultipartParseStatus.MALFORMED
+    else:
+        return (
+            MultipartDocument(
+                observation_id=observation_id,
+                direction=direction,
+                parse_status=MultipartParseStatus.PARSED,
+            ),
+            parts,
+        )
+    return (
+        MultipartDocument(
+            observation_id=observation_id,
+            direction=direction,
+            parse_status=status,
+        ),
+        (),
+    )
+
+
+def _multipart_structure(
+    observation: Observation, normalized: NormalizedExchange
+) -> tuple[tuple[MultipartDocument, ...], tuple[MultipartPartObservation, ...]]:
+    documents: list[MultipartDocument] = []
+    parts: list[MultipartPartObservation] = []
+    candidates = (
+        (
+            MultipartDirection.REQUEST,
+            normalized.request_body_kind,
+            normalized.request_content_type,
+            observation.raw_request,
+        ),
+        (
+            MultipartDirection.RESPONSE,
+            normalized.response_body_kind,
+            normalized.response_content_type,
+            observation.raw_response,
+        ),
+    )
+    for direction, body_kind, content_type, raw_message in candidates:
+        if (
+            body_kind is not BodyKind.MULTIPART
+            or content_type != "multipart/form-data"
+            or raw_message is None
+        ):
+            continue
+        document, document_parts = _extract_multipart_document(
+            observation.id, direction, raw_message
+        )
+        documents.append(document)
+        parts.extend(document_parts)
+    return tuple(documents), tuple(parts)
+
+
 def extract_structure(
     observation: Observation, normalized: NormalizedExchange
 ) -> StructuralExtraction:
@@ -509,6 +892,9 @@ def extract_structure(
     )
     json_documents, json_fields = _json_structure(observation, normalized)
     form_documents, form_fields = _form_structure(observation, normalized)
+    multipart_documents, multipart_parts = _multipart_structure(
+        observation, normalized
+    )
     return StructuralExtraction(
         observation_id=observation.id,
         structural_version=STRUCTURAL_VERSION,
@@ -519,4 +905,6 @@ def extract_structure(
         json_fields=json_fields,
         form_documents=form_documents,
         form_fields=form_fields,
+        multipart_documents=multipart_documents,
+        multipart_parts=multipart_parts,
     )

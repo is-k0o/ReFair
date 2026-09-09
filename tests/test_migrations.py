@@ -89,7 +89,7 @@ def test_legacy_database_migrates_without_changing_raw_observation(tmp_path) -> 
     assert after == before
     assert bytes(after[8]) == observation.raw_request
     assert bytes(after[9]) == observation.raw_response
-    assert version == CURRENT_SCHEMA_VERSION == 5
+    assert version == CURRENT_SCHEMA_VERSION == 6
     assert normalized_table == ("normalized_exchanges",)
     assert "raw_request" not in normalized_columns
     assert "raw_response" not in normalized_columns
@@ -133,7 +133,7 @@ def test_schema_one_migration_preserves_raw_and_normalized_rows(tmp_path) -> Non
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert (
             connection.execute("SELECT * FROM observations").fetchall()
             == raw_before
@@ -283,7 +283,7 @@ def test_schema_two_migrates_and_reprocesses_json_without_changing_b1_or_evidenc
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         for table, rows in preserved.items():
             assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
         assert bytes(preserved["observations"][0][8]) == observation.raw_request
@@ -451,7 +451,7 @@ def test_schema_four_preserves_b2a_rows_then_reprocesses_for_form_extraction(
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         for table, rows in preserved.items():
             assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
         assert bytes(preserved["observations"][0][8]) == observation.raw_request
@@ -489,3 +489,149 @@ def test_schema_four_preserves_b2a_rows_then_reprocesses_for_form_extraction(
         assert connection.execute(
             "SELECT structural_version FROM structural_processing"
         ).fetchone() == (STRUCTURAL_VERSION,)
+
+
+def test_schema_five_adds_only_multipart_tables_and_reprocesses_once(tmp_path) -> None:
+    database = tmp_path / "schema-five.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(LEGACY_SCHEMA)
+        for version in range(1, 6):
+            connection.executescript(MIGRATIONS[version])
+        connection.execute("PRAGMA user_version = 5")
+
+    repository = SQLiteRepository(database)
+    observations = (
+        Observation(
+            id=UUID("66666666-6666-4666-8666-666666666666"),
+            project_id=UUID("11111111-1111-4111-8111-111111111111"),
+            observed_at=datetime(2026, 9, 9, 11, 0, tzinfo=timezone.utc),
+            provenance=ObservationProvenance.BROWSER,
+            actor_id="actor_multipart",
+            method="POST",
+            url="https://example.test/upload",
+            response_status=200,
+            raw_request=(
+                b"POST /upload HTTP/1.1\r\nContent-Type: multipart/form-data; "
+                b"boundary=b\r\n\r\n--b\r\nContent-Disposition: form-data; "
+                b'name="avatar"; filename="private.png"\r\nContent-Type: '
+                b"image/png\r\n\r\nprivate-file-bytes\r\n--b--\r\n"
+            ),
+            raw_response=(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                b'{"id":"secret"}'
+            ),
+        ),
+        Observation(
+            id=UUID("77777777-7777-4777-8777-777777777777"),
+            project_id=UUID("11111111-1111-4111-8111-111111111111"),
+            observed_at=datetime(2026, 9, 9, 11, 1, tzinfo=timezone.utc),
+            provenance=ObservationProvenance.BROWSER,
+            actor_id="actor_form",
+            method="POST",
+            url="https://example.test/upload",
+            response_status=204,
+            raw_request=(
+                b"POST /upload HTTP/1.1\r\nContent-Type: "
+                b"application/x-www-form-urlencoded\r\n\r\nfield=value"
+            ),
+            raw_response=b"HTTP/1.1 204 No Content\r\n\r\n",
+        ),
+    )
+    extractions = []
+    for observation in observations:
+        repository.add_observation(observation)
+        normalized = repository.add_normalized_exchange(
+            normalize_observation(observation)
+        )
+        extractions.append(extract_structure(observation, normalized))
+
+    with sqlite3.connect(database) as connection:
+        for extraction in extractions:
+            endpoint = extraction.endpoint
+            operation = extraction.operation
+            connection.execute(
+                "INSERT OR IGNORE INTO exact_endpoints VALUES (?, ?, ?, ?, ?, ?)",
+                (str(endpoint.id), str(endpoint.project_id), endpoint.scheme, endpoint.host, endpoint.port, endpoint.path),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO http_operations VALUES (?, ?, ?)",
+                (str(operation.id), str(operation.endpoint_id), operation.method),
+            )
+            connection.execute(
+                "INSERT INTO operation_observations VALUES (?, ?)",
+                (str(extraction.observation_id), str(operation.id)),
+            )
+            connection.executemany(
+                "INSERT INTO method_advertisements VALUES (?, ?, ?, ?)",
+                [(str(item.endpoint_id), item.source.value, item.advertised_method, str(item.observation_id)) for item in extraction.advertisements],
+            )
+            connection.executemany(
+                "INSERT INTO json_documents VALUES (?, ?, ?, ?)",
+                [(str(item.observation_id), item.direction.value, item.parse_status.value, item.root_type.value if item.root_type else None) for item in extraction.json_documents],
+            )
+            connection.executemany(
+                "INSERT INTO json_field_observations VALUES (?, ?, ?, ?, ?)",
+                [(str(item.observation_id), item.direction.value, json.dumps(item.path, separators=(",", ":")), item.json_type.value, int(item.duplicate_key_observed)) for item in extraction.json_fields],
+            )
+            connection.executemany(
+                "INSERT INTO form_documents VALUES (?, ?, ?)",
+                [(str(item.observation_id), item.direction.value, item.parse_status.value) for item in extraction.form_documents],
+            )
+            connection.executemany(
+                "INSERT INTO form_field_observations VALUES (?, ?, ?, ?, ?)",
+                [(str(item.observation_id), item.direction.value, item.field_name, item.occurrence_count, item.assigned_occurrence_count) for item in extraction.form_fields],
+            )
+            connection.execute(
+                "INSERT INTO structural_processing VALUES (?, 4)",
+                (str(extraction.observation_id),),
+            )
+
+    preserved_tables = (
+        "observations",
+        "normalized_exchanges",
+        "exact_endpoints",
+        "http_operations",
+        "operation_observations",
+        "method_advertisements",
+        "json_documents",
+        "json_field_observations",
+        "form_documents",
+        "form_field_observations",
+    )
+    with sqlite3.connect(database) as connection:
+        preserved = {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in preserved_tables
+        }
+
+    repository.initialize()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        for table, rows in preserved.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'multipart_%'"
+            )
+        } == {"multipart_documents", "multipart_parts", "multipart_part_names"}
+
+    first = process_structure_pending(repository)
+    second = process_structure_pending(repository)
+    assert (first.processed, first.pending) == (2, 0)
+    assert second.processed == 0
+    with sqlite3.connect(database) as connection:
+        for table, rows in preserved.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+        assert connection.execute("SELECT COUNT(*) FROM multipart_documents").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM multipart_parts").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM multipart_part_names").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT structural_version, COUNT(*) FROM structural_processing GROUP BY structural_version"
+        ).fetchall() == [(STRUCTURAL_VERSION, 2)]
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='observations'"
+            )
+        } == {"observations_immutable_update", "observations_immutable_delete"}
