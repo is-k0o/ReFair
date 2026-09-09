@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import sqlite3
 from uuid import UUID
 
@@ -25,8 +26,10 @@ def make_observation(
     *,
     request_body: bytes = b"",
     request_content_type: str | None = "application/json",
+    request_content_encodings: tuple[str, ...] = (),
     response_body: bytes = b"",
     response_content_type: str | None = None,
+    response_content_encodings: tuple[str, ...] = (),
     url: str = "https://api.test/items",
 ) -> Observation:
     request_headers = (
@@ -38,6 +41,14 @@ def make_observation(
         b"Content-Type: " + response_content_type.encode("ascii") + b"\r\n"
         if response_content_type is not None
         else b""
+    )
+    request_headers += b"".join(
+        b"Content-Encoding: " + value.encode("ascii") + b"\r\n"
+        for value in request_content_encodings
+    )
+    response_headers += b"".join(
+        b"Content-Encoding: " + value.encode("ascii") + b"\r\n"
+        for value in response_content_encodings
     )
     return Observation(
         project_id=PROJECT_ID,
@@ -323,3 +334,187 @@ def test_json_limits_store_status_without_partial_fields(tmp_path, monkeypatch) 
             (status, None)
         ]
         assert repository.operation_json_fields(extraction.operation.id) == ()
+
+
+def test_valid_gzip_json_request_is_decoded_before_parsing(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "gzip-request.sqlite3")
+    repository.initialize()
+    observation = make_observation(
+        request_body=gzip.compress(
+            b'{"user":{"id":"request-secret","active":true}}', mtime=0
+        ),
+        request_content_encodings=(" GZip ",),
+    )
+    observation = observation.model_copy(
+        update={
+            "raw_request": observation.raw_request.replace(
+                b"Content-Encoding", b"cOnTeNt-EnCoDiNg"
+            )
+        }
+    )
+    extraction = persist(
+        repository,
+        observation,
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.PARSED, JsonType.OBJECT)
+    ]
+    fields = repository.operation_json_fields(extraction.operation.id)
+    assert {(item.path, item.json_type) for item in fields} == {
+        (("user",), JsonType.OBJECT),
+        (("user", "id"), JsonType.STRING),
+        (("user", "active"), JsonType.BOOLEAN),
+    }
+    assert "request-secret" not in "".join(
+        item.model_dump_json() for item in fields
+    )
+
+
+def test_valid_gzip_json_response_is_direction_distinct(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "gzip-response.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(
+            request_content_type=None,
+            response_content_type="application/problem+json",
+            response_content_encodings=("x-gzip",),
+            response_body=gzip.compress(b'{"result":[1,2]}', mtime=0),
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [
+        (item.direction, item.parse_status, item.root_type) for item in outcomes
+    ] == [(JsonDirection.RESPONSE, JsonParseStatus.PARSED, JsonType.OBJECT)]
+    fields = repository.operation_json_fields(extraction.operation.id)
+    assert {(item.direction, item.path, item.json_type) for item in fields} == {
+        (JsonDirection.RESPONSE, ("result",), JsonType.ARRAY),
+        (
+            JsonDirection.RESPONSE,
+            ("result", JsonArrayItem.ITEM),
+            JsonType.NUMBER,
+        ),
+    }
+
+
+def test_corrupt_gzip_is_a_content_decoding_failure(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "corrupt-gzip.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(
+            request_body=b"not-a-gzip-stream",
+            request_content_encodings=("gzip",),
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.CONTENT_DECODING_FAILED, None)
+    ]
+    assert repository.operation_json_fields(extraction.operation.id) == ()
+
+
+def test_gzip_decoded_malformed_json_remains_malformed(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "gzip-malformed.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(
+            request_body=gzip.compress(b'{"broken":', mtime=0),
+            request_content_encodings=("gzip",),
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.MALFORMED, None)
+    ]
+    assert repository.operation_json_fields(extraction.operation.id) == ()
+
+
+def test_gzip_decoded_size_limit_has_no_partial_fields(
+    tmp_path, monkeypatch
+) -> None:
+    repository = SQLiteRepository(tmp_path / "gzip-size.sqlite3")
+    repository.initialize()
+    monkeypatch.setattr(structure, "MAX_JSON_DECODED_BYTES", 8)
+    extraction = persist(
+        repository,
+        make_observation(
+            request_body=gzip.compress(b'{"expanded":true}', mtime=0),
+            request_content_encodings=("gzip",),
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.SKIPPED_TOO_LARGE, None)
+    ]
+    assert repository.operation_json_fields(extraction.operation.id) == ()
+
+
+@pytest.mark.parametrize(
+    "content_encodings",
+    [
+        ("br",),
+        ("gzip, br",),
+        ("gzip", "identity"),
+    ],
+)
+def test_unsupported_or_ambiguous_content_encodings_are_not_parsed(
+    tmp_path, content_encodings
+) -> None:
+    repository = SQLiteRepository(tmp_path / "unsupported.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(
+            request_body=b"{}",
+            request_content_encodings=content_encodings,
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.UNSUPPORTED_CONTENT_ENCODING, None)
+    ]
+    assert repository.operation_json_fields(extraction.operation.id) == ()
+
+
+@pytest.mark.parametrize("content_encodings", [(), ("identity",)])
+def test_absent_and_identity_content_encoding_keep_json_behavior(
+    tmp_path, content_encodings
+) -> None:
+    repository = SQLiteRepository(tmp_path / "identity.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(
+            request_body=b'{"id":1}',
+            request_content_encodings=content_encodings,
+        ),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.PARSED, JsonType.OBJECT)
+    ]
+
+
+def test_anti_xssi_prefix_is_not_stripped(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "anti-xssi.sqlite3")
+    repository.initialize()
+    extraction = persist(
+        repository,
+        make_observation(request_body=b")]}\'\n[[],{}]"),
+    )
+
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.MALFORMED, None)
+    ]
+    assert repository.operation_json_fields(extraction.operation.id) == ()

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import zlib
 from dataclasses import dataclass
+from io import BytesIO
 from uuid import UUID, uuid5
 
 from refair.models.evidence import Observation
@@ -25,9 +28,10 @@ from refair.normalization import _split_headers_and_body
 
 # If normalization changes scheme/host/port/path, structural identity must be
 # invalidated with a STRUCTURAL_VERSION bump and a deliberate derived-state rebuild.
-STRUCTURAL_VERSION = 2
+STRUCTURAL_VERSION = 3
 
 MAX_JSON_BODY_BYTES = 1_048_576
+MAX_JSON_DECODED_BYTES = 1_048_576
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 10_000
 
@@ -182,13 +186,79 @@ def _canonical_path(path: JsonPath) -> str:
     )
 
 
+def _content_encoding(header_bytes: bytes) -> str | None:
+    values: list[str] = []
+    for line in header_bytes.decode("latin-1").splitlines()[1:]:
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == "content-encoding":
+            values.append(value)
+    if not values:
+        return "identity"
+    if len(values) != 1:
+        return None
+
+    tokens = [token.strip().lower() for token in values[0].split(",")]
+    if not tokens or any(not token for token in tokens):
+        return None
+    non_identity = [token for token in tokens if token != "identity"]
+    if not non_identity:
+        return "identity"
+    if len(non_identity) == 1 and non_identity[0] in {"gzip", "x-gzip"}:
+        return "gzip"
+    return None
+
+
+def _decode_gzip(body: bytes) -> tuple[bytes | None, JsonParseStatus | None]:
+    try:
+        with gzip.GzipFile(fileobj=BytesIO(body), mode="rb") as stream:
+            decoded = stream.read(MAX_JSON_DECODED_BYTES + 1)
+    except (EOFError, MemoryError, OSError, OverflowError, zlib.error):
+        return None, JsonParseStatus.CONTENT_DECODING_FAILED
+    if len(decoded) > MAX_JSON_DECODED_BYTES:
+        return None, JsonParseStatus.SKIPPED_TOO_LARGE
+    return decoded, None
+
+
 def _extract_json_document(
     observation_id: UUID,
     direction: JsonDirection,
     raw_message: bytes,
 ) -> tuple[JsonDocument, tuple[JsonFieldObservation, ...]]:
-    _, body = _split_headers_and_body(raw_message, direction.value.lower(), [])
+    headers, body = _split_headers_and_body(
+        raw_message, direction.value.lower(), []
+    )
     if len(body) > MAX_JSON_BODY_BYTES:
+        return (
+            JsonDocument(
+                observation_id=observation_id,
+                direction=direction,
+                parse_status=JsonParseStatus.SKIPPED_TOO_LARGE,
+            ),
+            (),
+        )
+    encoding = _content_encoding(headers)
+    if encoding is None:
+        return (
+            JsonDocument(
+                observation_id=observation_id,
+                direction=direction,
+                parse_status=JsonParseStatus.UNSUPPORTED_CONTENT_ENCODING,
+            ),
+            (),
+        )
+    if encoding == "gzip":
+        body, decode_status = _decode_gzip(body)
+        if decode_status is not None:
+            return (
+                JsonDocument(
+                    observation_id=observation_id,
+                    direction=direction,
+                    parse_status=decode_status,
+                ),
+                (),
+            )
+        assert body is not None
+    if len(body) > MAX_JSON_DECODED_BYTES:
         return (
             JsonDocument(
                 observation_id=observation_id,

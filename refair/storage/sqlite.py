@@ -33,7 +33,7 @@ from refair.models.structure import (
 )
 from refair.structure import StructuralExtraction
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 LEGACY_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -218,6 +218,66 @@ CREATE TABLE json_field_observations (
     FOREIGN KEY (observation_id, direction)
         REFERENCES json_documents(observation_id, direction) ON DELETE CASCADE
 );
+
+CREATE INDEX json_field_observations_operation_join_idx
+ON json_field_observations(observation_id, direction);
+""",
+    4: """
+ALTER TABLE json_field_observations
+RENAME TO json_field_observations_schema_3;
+
+ALTER TABLE json_documents
+RENAME TO json_documents_schema_3;
+
+CREATE TABLE json_documents (
+    observation_id TEXT NOT NULL REFERENCES observations(id),
+    direction TEXT NOT NULL CHECK(direction IN ('REQUEST', 'RESPONSE')),
+    parse_status TEXT NOT NULL CHECK(
+        parse_status IN (
+            'PARSED', 'MALFORMED', 'SKIPPED_TOO_LARGE', 'LIMIT_EXCEEDED',
+            'UNSUPPORTED_CONTENT_ENCODING', 'CONTENT_DECODING_FAILED'
+        )
+    ),
+    root_type TEXT CHECK(
+        root_type IS NULL OR
+        root_type IN ('OBJECT', 'ARRAY', 'STRING', 'NUMBER', 'BOOLEAN', 'NULL')
+    ),
+    CHECK(
+        (parse_status = 'PARSED' AND root_type IS NOT NULL) OR
+        (parse_status != 'PARSED' AND root_type IS NULL)
+    ),
+    PRIMARY KEY (observation_id, direction)
+);
+
+CREATE TABLE json_field_observations (
+    observation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    path TEXT NOT NULL,
+    json_type TEXT NOT NULL CHECK(
+        json_type IN ('OBJECT', 'ARRAY', 'STRING', 'NUMBER', 'BOOLEAN', 'NULL')
+    ),
+    duplicate_key_observed INTEGER NOT NULL CHECK(
+        duplicate_key_observed IN (0, 1)
+    ),
+    PRIMARY KEY (observation_id, direction, path, json_type),
+    FOREIGN KEY (observation_id, direction)
+        REFERENCES json_documents(observation_id, direction) ON DELETE CASCADE
+);
+
+INSERT INTO json_documents (
+    observation_id, direction, parse_status, root_type
+)
+SELECT observation_id, direction, parse_status, root_type
+FROM json_documents_schema_3;
+
+INSERT INTO json_field_observations (
+    observation_id, direction, path, json_type, duplicate_key_observed
+)
+SELECT observation_id, direction, path, json_type, duplicate_key_observed
+FROM json_field_observations_schema_3;
+
+DROP TABLE json_field_observations_schema_3;
+DROP TABLE json_documents_schema_3;
 
 CREATE INDEX json_field_observations_operation_join_idx
 ON json_field_observations(observation_id, direction);

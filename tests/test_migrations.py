@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import gzip
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
 
-from refair.models import Observation, ObservationProvenance
+from refair.models import (
+    JsonParseStatus,
+    JsonType,
+    Observation,
+    ObservationProvenance,
+)
 from refair.normalization import normalize_observation
 from refair.process.cli import process_structure_pending
 from refair.storage import (
@@ -81,7 +88,7 @@ def test_legacy_database_migrates_without_changing_raw_observation(tmp_path) -> 
     assert after == before
     assert bytes(after[8]) == observation.raw_request
     assert bytes(after[9]) == observation.raw_response
-    assert version == CURRENT_SCHEMA_VERSION == 3
+    assert version == CURRENT_SCHEMA_VERSION == 4
     assert normalized_table == ("normalized_exchanges",)
     assert "raw_request" not in normalized_columns
     assert "raw_response" not in normalized_columns
@@ -125,7 +132,7 @@ def test_schema_one_migration_preserves_raw_and_normalized_rows(tmp_path) -> Non
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             connection.execute("SELECT * FROM observations").fetchall()
             == raw_before
@@ -275,7 +282,7 @@ def test_schema_two_migrates_and_reprocesses_json_without_changing_b1_or_evidenc
     repository.initialize()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         for table, rows in preserved.items():
             assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
         assert bytes(preserved["observations"][0][8]) == observation.raw_request
@@ -312,6 +319,99 @@ def test_schema_two_migrates_and_reprocesses_json_without_changing_b1_or_evidenc
     assert repository.count_http_operations() == 1
     assert repository.count_operation_observations() == 1
     assert repository.count_method_advertisements() == 2
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT structural_version FROM structural_processing"
+        ).fetchone() == (STRUCTURAL_VERSION,)
+
+
+def test_schema_three_preserves_b2a_rows_then_reprocesses_for_content_encoding(
+    tmp_path,
+) -> None:
+    database = tmp_path / "schema-three.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(LEGACY_SCHEMA)
+        connection.executescript(MIGRATIONS[1])
+        connection.executescript(MIGRATIONS[2])
+        connection.executescript(MIGRATIONS[3])
+        connection.execute("PRAGMA user_version = 3")
+
+    repository = SQLiteRepository(database)
+    observation = repository.add_observation(
+        Observation(
+            id=UUID("55555555-5555-4555-8555-555555555555"),
+            project_id=UUID("11111111-1111-4111-8111-111111111111"),
+            observed_at=datetime(2026, 9, 9, 10, 30, tzinfo=timezone.utc),
+            provenance=ObservationProvenance.BROWSER,
+            actor_id="actor_gzip",
+            method="POST",
+            url="https://example.test/gzip",
+            response_status=200,
+            raw_request=(
+                b"POST /gzip HTTP/1.1\r\nContent-Type: application/json\r\n"
+                b"Content-Encoding: gzip\r\n\r\n"
+                + gzip.compress(b'{"id":"raw-secret"}', mtime=0)
+            ),
+            raw_response=b"HTTP/1.1 200 OK\r\n\r\n",
+        )
+    )
+    normalized = repository.add_normalized_exchange(
+        normalize_observation(observation)
+    )
+    extraction = extract_structure(observation, normalized)
+    old_extraction = replace(
+        extraction,
+        structural_version=2,
+    )
+    assert repository.add_structural_extraction(old_extraction)
+
+    preserved_tables = (
+        "observations",
+        "normalized_exchanges",
+        "exact_endpoints",
+        "http_operations",
+        "operation_observations",
+        "method_advertisements",
+        "json_documents",
+        "json_field_observations",
+        "structural_processing",
+    )
+    with sqlite3.connect(database) as connection:
+        preserved = {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in preserved_tables
+        }
+
+    repository.initialize()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        for table, rows in preserved.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+        assert bytes(preserved["observations"][0][8]) == observation.raw_request
+        assert bytes(preserved["observations"][0][9]) == observation.raw_response
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND tbl_name = 'observations'"
+            )
+        } == {
+            "observations_immutable_update",
+            "observations_immutable_delete",
+        }
+
+    first = process_structure_pending(repository)
+    second = process_structure_pending(repository)
+
+    assert first.processed == 1
+    assert first.pending == 0
+    assert second.processed == 0
+    outcomes = repository.operation_json_document_outcomes(extraction.operation.id)
+    assert [(item.parse_status, item.root_type) for item in outcomes] == [
+        (JsonParseStatus.PARSED, JsonType.OBJECT)
+    ]
+    assert repository.count_json_field_observations() == 1
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT structural_version FROM structural_processing"
