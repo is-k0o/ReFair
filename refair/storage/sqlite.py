@@ -12,7 +12,12 @@ from pathlib import Path
 from uuid import UUID
 
 from refair.assets.identity import Asset, content_sha256, normalize_response_body
-from refair.models.evidence import Hypothesis, Observation, ObservationProvenance
+from refair.models.evidence import (
+    Hypothesis,
+    HypothesisStatus,
+    Observation,
+    ObservationProvenance,
+)
 from refair.models.normalized import BodyKind, NormalizedExchange
 from refair.models.structure import (
     ActorOutcome,
@@ -22,6 +27,7 @@ from refair.models.structure import (
     HttpOperation,
     JsonArrayItem,
     JsonDirection,
+    JsonFieldObservation,
     JsonParseStatus,
     JsonPath,
     JsonType,
@@ -385,6 +391,30 @@ class ObservationMetadata:
     response_status: int | None
     request_size: int
     response_size: int
+
+
+@dataclass(frozen=True)
+class OperationObservationMetadata:
+    """RAW-free metadata for one observation linked to an operation."""
+
+    observation_id: UUID
+    project_id: UUID
+    observed_at: datetime
+    provenance: ObservationProvenance
+    actor_id: str | None
+    response_status: int | None
+
+
+@dataclass(frozen=True)
+class OperationHypothesisWitnesses:
+    """Hypothesis evidence witnesses belonging to one operation only."""
+
+    id: UUID
+    project_id: UUID
+    statement: str
+    status: HypothesisStatus
+    supporting_observation_ids: tuple[UUID, ...]
+    contradicting_observation_ids: tuple[UUID, ...]
 
 
 def _serialize_json_path(path: JsonPath) -> str:
@@ -1103,6 +1133,14 @@ class SQLiteRepository:
             ).fetchall()
         return tuple(self._exact_endpoint_from_row(row) for row in rows)
 
+    def get_exact_endpoint(self, endpoint_id: UUID) -> ExactEndpoint | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM exact_endpoints WHERE id = ?",
+                (str(endpoint_id),),
+            ).fetchone()
+        return None if row is None else self._exact_endpoint_from_row(row)
+
     @staticmethod
     def _http_operation_from_row(row: sqlite3.Row) -> HttpOperation:
         return HttpOperation(
@@ -1122,6 +1160,46 @@ class SQLiteRepository:
                 parameters,
             ).fetchall()
         return tuple(self._http_operation_from_row(row) for row in rows)
+
+    def get_http_operation(self, operation_id: UUID) -> HttpOperation | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM http_operations WHERE id = ?",
+                (str(operation_id),),
+            ).fetchone()
+        return None if row is None else self._http_operation_from_row(row)
+
+    def operation_observation_metadata(
+        self, operation_id: UUID
+    ) -> tuple[OperationObservationMetadata, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT observations.id AS observation_id,
+                       observations.project_id,
+                       observations.observed_at,
+                       observations.provenance,
+                       observations.actor_id,
+                       observations.response_status
+                FROM operation_observations
+                JOIN observations ON observations.id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                ORDER BY observations.observed_at DESC, observations.id
+                """,
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            OperationObservationMetadata(
+                observation_id=UUID(row["observation_id"]),
+                project_id=UUID(row["project_id"]),
+                observed_at=datetime.fromisoformat(row["observed_at"]),
+                provenance=ObservationProvenance(row["provenance"]),
+                actor_id=row["actor_id"],
+                response_status=row["response_status"],
+            )
+            for row in rows
+        )
 
     def list_method_advertisements(
         self, *, endpoint_id: UUID
@@ -1388,6 +1466,49 @@ class SQLiteRepository:
             for row in rows
         )
 
+    def operation_json_field_observations(
+        self,
+        operation_id: UUID,
+        *,
+        duplicate_keys_only: bool = False,
+    ) -> tuple[JsonFieldObservation, ...]:
+        duplicate_clause = (
+            " AND json_field_observations.duplicate_key_observed = 1"
+            if duplicate_keys_only
+            else ""
+        )
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT json_field_observations.observation_id,
+                       json_field_observations.direction,
+                       json_field_observations.path,
+                       json_field_observations.json_type,
+                       json_field_observations.duplicate_key_observed
+                FROM operation_observations
+                JOIN json_field_observations ON
+                    json_field_observations.observation_id =
+                    operation_observations.observation_id
+                WHERE operation_observations.operation_id = ?
+                """
+                + duplicate_clause
+                + " ORDER BY json_field_observations.observation_id, "
+                "json_field_observations.direction, "
+                "json_field_observations.path, "
+                "json_field_observations.json_type",
+                (str(operation_id),),
+            ).fetchall()
+        return tuple(
+            JsonFieldObservation(
+                observation_id=UUID(row["observation_id"]),
+                direction=JsonDirection(row["direction"]),
+                path=_deserialize_json_path(row["path"]),
+                json_type=JsonType(row["json_type"]),
+                duplicate_key_observed=bool(row["duplicate_key_observed"]),
+            )
+            for row in rows
+        )
+
     def operation_form_document_outcomes(
         self, operation_id: UUID
     ) -> tuple[OperationFormDocumentOutcome, ...]:
@@ -1544,6 +1665,77 @@ class SQLiteRepository:
             )
             for row in part_rows
         )
+
+    def operation_hypothesis_witnesses(
+        self, operation_id: UUID
+    ) -> tuple[OperationHypothesisWitnesses, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT hypotheses.id, hypotheses.project_id,
+                       hypotheses.statement, hypotheses.status,
+                       hypothesis_evidence.observation_id,
+                       hypothesis_evidence.relationship
+                FROM operation_observations
+                JOIN hypothesis_evidence ON
+                    hypothesis_evidence.observation_id =
+                    operation_observations.observation_id
+                JOIN hypotheses ON hypotheses.id =
+                    hypothesis_evidence.hypothesis_id
+                WHERE operation_observations.operation_id = ?
+                ORDER BY hypotheses.id, hypothesis_evidence.relationship,
+                         hypothesis_evidence.observation_id
+                """,
+                (str(operation_id),),
+            ).fetchall()
+
+        grouped: dict[
+            UUID,
+            tuple[UUID, str, HypothesisStatus, set[UUID], set[UUID]],
+        ] = {}
+        for row in rows:
+            hypothesis_id = UUID(row["id"])
+            identity = (
+                UUID(row["project_id"]),
+                row["statement"],
+                HypothesisStatus(row["status"]),
+            )
+            existing = grouped.get(hypothesis_id)
+            if existing is None:
+                existing = (*identity, set(), set())
+                grouped[hypothesis_id] = existing
+            elif existing[:3] != identity:
+                raise RuntimeError("conflicting hypothesis rows")
+            witness = UUID(row["observation_id"])
+            if row["relationship"] == "SUPPORTS":
+                existing[3].add(witness)
+            elif row["relationship"] == "CONTRADICTS":
+                existing[4].add(witness)
+            else:
+                raise RuntimeError("unknown hypothesis evidence relationship")
+
+        results: list[OperationHypothesisWitnesses] = []
+        for hypothesis_id in sorted(grouped, key=str):
+            project_id, statement, status, supporting, contradicting = grouped[
+                hypothesis_id
+            ]
+            if supporting.intersection(contradicting):
+                raise RuntimeError(
+                    "operation witness cannot support and contradict a hypothesis"
+                )
+            results.append(
+                OperationHypothesisWitnesses(
+                    id=hypothesis_id,
+                    project_id=project_id,
+                    statement=statement,
+                    status=status,
+                    supporting_observation_ids=tuple(sorted(supporting, key=str)),
+                    contradicting_observation_ids=tuple(
+                        sorted(contradicting, key=str)
+                    ),
+                )
+            )
+        return tuple(results)
 
     def add_hypothesis(self, hypothesis: Hypothesis) -> Hypothesis:
         self._require_writable()
