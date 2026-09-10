@@ -8,6 +8,14 @@ from refair.models.budget import (
     RunBudget,
     RunUsage,
 )
+from refair.models.analytic import (
+    AssetGrounding,
+    ExactEndpointGrounding,
+    ExplorationLead,
+    GroundingReference,
+    HttpOperationGrounding,
+    ObservationGrounding,
+)
 from refair.models.evidence import (
     Entity,
     EntityClaim,
@@ -25,6 +33,16 @@ from refair.models.experiment import (
 )
 from refair.models.normalized import BodyKind, NormalizedExchange
 from refair.models.project import Actor, Project, TenantKnowledge
+from refair.models.planner import (
+    AssetReferencedUrlTarget,
+    ExactEndpointTarget,
+    ExistingOperationTarget,
+    ExperimentProposal,
+    ExplorationProposal,
+    PlannerDecision,
+    PlannerTarget,
+    WaitDecision,
+)
 from refair.models.state import RunState, RunStatus
 from refair.models.structure import (
     ActorOutcome,
@@ -60,6 +78,8 @@ from refair.models.structure import (
 
 __all__ = [
     "Actor",
+    "AssetGrounding",
+    "AssetReferencedUrlTarget",
     "ApiBudgetLimits",
     "ApiUsage",
     "ActorOutcome",
@@ -67,16 +87,24 @@ __all__ = [
     "Entity",
     "EntityClaim",
     "ExactEndpoint",
+    "ExactEndpointGrounding",
+    "ExactEndpointTarget",
     "FormDirection",
     "FormDocument",
     "FormFieldObservation",
     "FormParseStatus",
     "Experiment",
+    "ExperimentProposal",
     "ExperimentResult",
     "ExperimentStatus",
+    "ExplorationLead",
+    "ExplorationProposal",
+    "ExistingOperationTarget",
+    "GroundingReference",
     "HttpBudgetLimits",
     "HttpUsage",
     "HttpOperation",
+    "HttpOperationGrounding",
     "Hypothesis",
     "HypothesisStatus",
     "JsonArrayItem",
@@ -94,6 +122,7 @@ __all__ = [
     "MultipartPartName",
     "MultipartPartObservation",
     "Observation",
+    "ObservationGrounding",
     "ObservationProvenance",
     "OperationQueryShape",
     "OperationJsonDocumentOutcome",
@@ -104,6 +133,8 @@ __all__ = [
     "NormalizedExchange",
     "PolicyDecision",
     "PolicyOutcome",
+    "PlannerDecision",
+    "PlannerTarget",
     "Project",
     "RequestRepresentation",
     "ResponseRepresentation",
@@ -112,4 +143,5 @@ __all__ = [
     "RunStatus",
     "RunUsage",
     "TenantKnowledge",
+    "WaitDecision",
 ]
