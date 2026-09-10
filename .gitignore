@@ -44,3 +44,6 @@ Thumbs.db
 # Local Burp configuration
 refair-burp-project-settings.json
 refair/refair-project-settings.json
+
+/multipart-smoke.html
+/refair-smoke.txt
