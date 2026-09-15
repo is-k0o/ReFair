@@ -7,11 +7,25 @@ from refair.context.compiler import (
     OperationContextInput,
     compile_operation_context,
 )
+from refair.context.evidence import (
+    DEFAULT_EVIDENCE_LIMITS,
+    EvidenceLimits,
+    HttpEvidenceExchange,
+    HttpEvidenceMessage,
+    OperationEvidenceBundle,
+    assemble_operation_evidence,
+)
 
 __all__ = [
     "DEFAULT_CONTEXT_LIMITS",
     "ContextLimits",
+    "DEFAULT_EVIDENCE_LIMITS",
+    "EvidenceLimits",
+    "HttpEvidenceExchange",
+    "HttpEvidenceMessage",
     "OperationContextInput",
+    "OperationEvidenceBundle",
     "assemble_operation_context",
+    "assemble_operation_evidence",
     "compile_operation_context",
 ]
