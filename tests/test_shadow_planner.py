@@ -166,6 +166,23 @@ def make_snapshot(*, json_field_count: int = 1):
     )
 
 
+def walk_json_nodes(value):
+    yield value
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from walk_json_nodes(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk_json_nodes(item)
+
+
+def referenced_definitions(schema, union):
+    return tuple(
+        schema["$defs"][branch["$ref"].rsplit("/", 1)[-1]]
+        for branch in union["anyOf"]
+    )
+
+
 def wait_draft(**updates) -> dict[str, object]:
     result: dict[str, object] = {
         "decision_type": "WAIT",
@@ -289,33 +306,64 @@ def test_api_request_contract_is_stateless_toolless_and_strict() -> None:
         assert prohibited not in request
 
 
-def test_provider_schema_is_strict_required_discriminated_and_asset_free() -> None:
+def test_provider_schema_uses_only_compatible_strict_unions() -> None:
     schema = _provider_output_schema()
     assert schema["type"] == "object"
-    decision = schema["properties"]["decision"]
-    assert decision["discriminator"]["propertyName"] == "decision_type"
-    assert set(decision["discriminator"]["mapping"]) == {
+    nodes = tuple(walk_json_nodes(schema))
+    assert any(isinstance(node, dict) and "anyOf" in node for node in nodes)
+    assert all(
+        "oneOf" not in node and "discriminator" not in node
+        for node in nodes
+        if isinstance(node, dict)
+    )
+
+    decision_definitions = referenced_definitions(
+        schema, schema["properties"]["decision"]
+    )
+    assert {
+        definition["properties"]["decision_type"]["const"]
+        for definition in decision_definitions
+    } == {
         "EXPERIMENT",
         "EXPLORATION",
         "WAIT",
     }
-    assert len(decision["oneOf"]) == 3
+
+    exploration_definition = next(
+        definition
+        for definition in decision_definitions
+        if definition["properties"]["decision_type"]["const"] == "EXPLORATION"
+    )
+    target_definitions = referenced_definitions(
+        schema, exploration_definition["properties"]["target"]
+    )
+    assert {
+        definition["properties"]["kind"]["const"]
+        for definition in target_definitions
+    } == {"EXISTING_OPERATION", "EXACT_ENDPOINT"}
+
+    experiment_definition = next(
+        definition
+        for definition in decision_definitions
+        if definition["properties"]["decision_type"]["const"] == "EXPERIMENT"
+    )
+    grounding_definitions = referenced_definitions(
+        schema, experiment_definition["properties"]["grounding"]["items"]
+    )
+    assert {
+        definition["properties"]["kind"]["const"]
+        for definition in grounding_definitions
+    } == {"OBSERVATION", "EXACT_ENDPOINT", "HTTP_OPERATION"}
+
     property_names: set[str] = set()
-
-    def inspect_node(node) -> None:
-        if isinstance(node, dict):
-            properties = node.get("properties")
-            if node.get("type") == "object" and isinstance(properties, dict):
-                assert node.get("additionalProperties") is False
-                assert set(node.get("required", ())) == set(properties)
-                property_names.update(properties)
-            for value in node.values():
-                inspect_node(value)
-        elif isinstance(node, list):
-            for value in node:
-                inspect_node(value)
-
-    inspect_node(schema)
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        properties = node.get("properties")
+        if node.get("type") == "object" and isinstance(properties, dict):
+            assert node.get("additionalProperties") is False
+            assert set(node.get("required", ())) == set(properties)
+            property_names.update(properties)
     assert "id" not in property_names
     assert "project_id" not in property_names
     assert "ASSET" not in json.dumps(schema, sort_keys=True)
@@ -584,6 +632,25 @@ def test_default_sdk_client_uses_environment_and_disables_retries(monkeypatch) -
     ids=["asset-target", "asset-grounding"],
 )
 def test_asset_variants_are_not_in_provider_contract(draft) -> None:
+    with pytest.raises(ShadowPlannerResponseError):
+        plan_shadow(make_snapshot(), client=fake_client(draft))
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        exploration_draft(
+            target={"kind": "UNKNOWN_TARGET", "operation_id": str(OPERATION_ID)}
+        ),
+        experiment_draft(
+            grounding=[
+                {"kind": "UNKNOWN_GROUNDING", "observation_id": str(OBSERVATION_ID)}
+            ]
+        ),
+    ],
+    ids=["target-kind", "grounding-kind"],
+)
+def test_unknown_provider_kinds_are_rejected(draft) -> None:
     with pytest.raises(ShadowPlannerResponseError):
         plan_shadow(make_snapshot(), client=fake_client(draft))
 

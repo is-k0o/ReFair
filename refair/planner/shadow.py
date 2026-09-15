@@ -62,10 +62,9 @@ class _ProviderExactEndpointTarget(BaseModel):
     endpoint_id: UUID
 
 
-_ProviderExplorationTarget = Annotated[
-    _ProviderExistingOperationTarget | _ProviderExactEndpointTarget,
-    Field(discriminator="kind"),
-]
+_ProviderExplorationTarget = (
+    _ProviderExistingOperationTarget | _ProviderExactEndpointTarget
+)
 
 
 class _ProviderObservationGrounding(BaseModel):
@@ -89,12 +88,11 @@ class _ProviderHttpOperationGrounding(BaseModel):
     operation_id: UUID
 
 
-_ProviderGrounding = Annotated[
+_ProviderGrounding = (
     _ProviderObservationGrounding
     | _ProviderExactEndpointGrounding
-    | _ProviderHttpOperationGrounding,
-    Field(discriminator="kind"),
-]
+    | _ProviderHttpOperationGrounding
+)
 
 
 class _ProviderExperimentDraft(BaseModel):
@@ -133,10 +131,9 @@ class _ProviderWaitDraft(BaseModel):
     related_lead_ids: tuple[UUID, ...]
 
 
-_ProviderDecision = Annotated[
-    _ProviderExperimentDraft | _ProviderExplorationDraft | _ProviderWaitDraft,
-    Field(discriminator="decision_type"),
-]
+_ProviderDecision = (
+    _ProviderExperimentDraft | _ProviderExplorationDraft | _ProviderWaitDraft
+)
 
 
 class _ProviderEnvelope(BaseModel):
