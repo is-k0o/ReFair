@@ -1,5 +1,6 @@
 import sqlite3
-from uuid import uuid4
+from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -90,3 +91,64 @@ def test_schema_initialization_is_repeatable(tmp_path) -> None:
     observation = make_observation()
     repository.add_observation(observation)
     assert repository.get_observation(observation.id) == observation
+
+
+def test_observation_metadata_window_is_scoped_ordered_and_raw_free(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "refair.sqlite3")
+    repository.initialize()
+    project_id = UUID("11111111-1111-4111-8111-111111111111")
+    other_project_id = UUID("99999999-9999-4999-8999-999999999999")
+    base = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+
+    def item(
+        identifier: str,
+        *,
+        seconds: int,
+        actor_id: str | None = "actor_a",
+        item_project_id: UUID = project_id,
+    ) -> Observation:
+        return make_observation().model_copy(
+            update={
+                "id": UUID(identifier),
+                "project_id": item_project_id,
+                "observed_at": base + timedelta(seconds=seconds),
+                "actor_id": actor_id,
+            }
+        )
+
+    later_id = item("44444444-4444-4444-8444-444444444442", seconds=5)
+    earlier_id = item("44444444-4444-4444-8444-444444444441", seconds=5)
+    before = item("44444444-4444-4444-8444-444444444443", seconds=-1)
+    after = item("44444444-4444-4444-8444-444444444444", seconds=11)
+    other_actor = item(
+        "44444444-4444-4444-8444-444444444445",
+        seconds=5,
+        actor_id="actor_b",
+    )
+    other_project = item(
+        "44444444-4444-4444-8444-444444444446",
+        seconds=5,
+        item_project_id=other_project_id,
+    )
+    for observation in (
+        later_id,
+        earlier_id,
+        before,
+        after,
+        other_actor,
+        other_project,
+    ):
+        repository.add_observation(observation)
+
+    rows = SQLiteRepository(
+        repository.path, read_only=True
+    ).observation_metadata_window(
+        project_id=project_id,
+        start=base,
+        end=base + timedelta(seconds=10),
+        actor_ids=("actor_a",),
+    )
+    assert tuple(row.id for row in rows) == (earlier_id.id, later_id.id)
+    assert all(row.project_id == project_id and row.actor_id == "actor_a" for row in rows)
+    assert all(row.observed_at.utcoffset() is not None for row in rows)
+    assert all(not hasattr(row, "raw_request") for row in rows)

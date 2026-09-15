@@ -592,6 +592,68 @@ class SQLiteRepository:
             for row in rows
         )
 
+    def observation_metadata_window(
+        self,
+        *,
+        project_id: UUID,
+        start: datetime,
+        end: datetime,
+        actor_ids: tuple[str, ...],
+    ) -> tuple[ObservationMetadata, ...]:
+        """Return chronologically ordered RAW-free metadata in one actor window."""
+
+        if start.utcoffset() is None or end.utcoffset() is None:
+            raise ValueError("observation metadata window must be timezone-aware")
+        if start > end:
+            raise ValueError("observation metadata window start must not exceed end")
+        canonical_actor_ids = tuple(sorted(set(actor_ids)))
+        if any(not actor_id for actor_id in canonical_actor_ids):
+            raise ValueError("actor IDs must be non-empty")
+        if canonical_actor_ids:
+            actor_clause = (
+                "actor_id IN ("
+                + ", ".join("?" for _ in canonical_actor_ids)
+                + ")"
+            )
+            actor_parameters: tuple[str, ...] = canonical_actor_ids
+        else:
+            actor_clause = "actor_id IS NULL"
+            actor_parameters = ()
+        parameters = (
+            str(project_id),
+            start.isoformat(),
+            end.isoformat(),
+            *actor_parameters,
+        )
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, project_id, observed_at, provenance, actor_id, method, "
+                "url, response_status, LENGTH(raw_request) AS request_size, "
+                "COALESCE(LENGTH(raw_response), 0) AS response_size "
+                "FROM observations WHERE project_id = ? "
+                "AND julianday(observed_at) >= julianday(?) "
+                "AND julianday(observed_at) <= julianday(?) "
+                f"AND {actor_clause} "
+                "ORDER BY julianday(observed_at) ASC, id ASC",
+                parameters,
+            ).fetchall()
+        metadata = tuple(
+            ObservationMetadata(
+                id=UUID(row["id"]),
+                project_id=UUID(row["project_id"]),
+                observed_at=datetime.fromisoformat(row["observed_at"]),
+                provenance=ObservationProvenance(row["provenance"]),
+                actor_id=row["actor_id"],
+                method=row["method"],
+                url=row["url"],
+                response_status=row["response_status"],
+                request_size=int(row["request_size"]),
+                response_size=int(row["response_size"]),
+            )
+            for row in rows
+        )
+        return tuple(sorted(metadata, key=lambda item: (item.observed_at, str(item.id))))
+
     @staticmethod
     def _observation_from_row(row: sqlite3.Row) -> Observation:
         return Observation(

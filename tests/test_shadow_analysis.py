@@ -10,6 +10,7 @@ import pytest
 from refair.context import (
     HttpEvidenceExchange,
     HttpEvidenceMessage,
+    HttpEvidenceOccurrence,
     OperationContextInput,
     OperationEvidenceBundle,
     compile_operation_context,
@@ -131,6 +132,8 @@ def exchange(
     actor_id: str,
     owner_id: int,
     tenant_id: int,
+    scope: str = "ANCHOR_OPERATION",
+    observed_at: datetime = BASE_TIME,
 ) -> HttpEvidenceExchange:
     request = message(
         "GET /orders/48291 HTTP/1.1\r\nHost: example.test\r\n\r\n"
@@ -143,7 +146,13 @@ def exchange(
         f'"actor":"{actor_id}"}}'
     )
     return HttpEvidenceExchange(
-        observation_ids=(observation_id,),
+        scope=scope,
+        occurrences=(
+            HttpEvidenceOccurrence(
+                observation_id=observation_id,
+                observed_at=observed_at,
+            ),
+        ),
         actor_id=actor_id,
         provenance=ObservationProvenance.BROWSER,
         method="GET",
@@ -170,15 +179,29 @@ def make_evidence(
         + (item.response.byte_count if item.response is not None else 0)
         for item in exchanges
     )
+    available_observations = sum(len(item.occurrences) for item in exchanges)
+    anchor_observations = sum(
+        len(item.occurrences)
+        for item in exchanges
+        if item.scope == "ANCHOR_OPERATION"
+    )
     return OperationEvidenceBundle(
         project_id=project_id,
         operation_id=operation_id,
         exchanges=exchanges,
-        available_exchange_count=len(exchanges),
+        anchor_observation_count=anchor_observations,
+        workflow_candidate_observation_count=(
+            available_observations - anchor_observations
+        ),
+        available_observation_count=available_observations,
+        unique_exchange_count=len(exchanges),
         included_exchange_count=len(exchanges),
-        omitted_duplicate_count=0,
+        omitted_duplicate_count=available_observations - len(exchanges),
         omitted_by_exchange_limit_count=0,
         omitted_too_large_count=0,
+        omitted_static_asset_count=0,
+        omitted_outside_authority_count=0,
+        omitted_by_workflow_limit_count=0,
         total_included_bytes=total_bytes,
     )
 
@@ -223,6 +246,11 @@ def test_analysis_input_is_canonical_and_preserves_cross_actor_values() -> None:
         assert value in serialized_exchanges
     assert INJECTION_LIKE_TEXT in first
     assert INJECTION_LIKE_TEXT not in _ASTRA_SHADOW_ANALYSIS_INSTRUCTIONS
+    assert "ANCHOR_OPERATION" in _ASTRA_SHADOW_ANALYSIS_INSTRUCTIONS
+    assert "WORKFLOW_CONTEXT" in _ASTRA_SHADOW_ANALYSIS_INSTRUCTIONS
+    assert "does not prove a causal workflow relationship" in (
+        _ASTRA_SHADOW_ANALYSIS_INSTRUCTIONS
+    )
     assert "OPENAI_API_KEY" not in first
 
 
@@ -332,6 +360,26 @@ def test_duplicate_statements_are_not_semantically_deduplicated() -> None:
 def test_invalid_hypothesis_evidence_references_are_rejected(draft) -> None:
     with pytest.raises(ShadowAnalysisValidationError):
         analyze_shadow(make_snapshot(), make_evidence(), client=fake_client([draft]))
+
+
+def test_analysis_accepts_anchor_and_workflow_context_references() -> None:
+    snapshot = make_snapshot(observation_ids=(O1,))
+    evidence = make_evidence(
+        exchanges=(
+            exchange(O1, actor_id="actor_a", owner_id=153, tenant_id=7),
+            exchange(
+                O2,
+                actor_id="actor_a",
+                owner_id=153,
+                tenant_id=7,
+                scope="WORKFLOW_CONTEXT",
+                observed_at=BASE_TIME + timedelta(seconds=1),
+            ),
+        )
+    )
+    draft = hypothesis_draft(supporting_evidence_ids=[str(O1), str(O2)])
+    result = analyze_shadow(snapshot, evidence, client=fake_client([draft]))
+    assert result[0].supporting_evidence_ids == (O1, O2)
 
 
 def test_zero_hypotheses_is_a_valid_success() -> None:

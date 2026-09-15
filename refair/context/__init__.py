@@ -12,6 +12,7 @@ from refair.context.evidence import (
     EvidenceLimits,
     HttpEvidenceExchange,
     HttpEvidenceMessage,
+    HttpEvidenceOccurrence,
     OperationEvidenceBundle,
     assemble_operation_evidence,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "EvidenceLimits",
     "HttpEvidenceExchange",
     "HttpEvidenceMessage",
+    "HttpEvidenceOccurrence",
     "OperationContextInput",
     "OperationEvidenceBundle",
     "assemble_operation_context",
